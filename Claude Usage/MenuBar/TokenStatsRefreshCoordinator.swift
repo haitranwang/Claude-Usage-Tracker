@@ -9,8 +9,11 @@ import Foundation
 /// toggle or card change takes effect on the next tick without re-wiring anything.
 ///
 /// `@MainActor` because the concrete implementation (the active profile's icon config) is
-/// main-actor state. Coordinator methods that touch this protocol are themselves `@MainActor`
-/// so the compiler enforces the contract instead of it being a comment.
+/// main-actor state. The app target infers this automatically for every unannotated type
+/// (`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`), so within that module the annotation is
+/// redundant. It is kept because the test target does not set that build setting, so here it is
+/// what pins conforming stub types - and the coordinator methods that touch this protocol - to
+/// the main actor.
 @MainActor
 protocol TokenStatsInputProviding: AnyObject {
     var enabledTokenFrames: Set<MenuBarMetricType> { get }
@@ -28,10 +31,17 @@ protocol TokenStatsRefreshCoordinatorDelegate: AnyObject {
 /// touched in that period. Running them on the 30-second usage timer meant re-reading tens of
 /// megabytes twice a minute, so they get their own timer at `Constants.RefreshIntervals.tokenStats`.
 ///
-/// The class itself is *not* `@MainActor`: the scan runs on a background queue, and the
-/// lock-protected flags below (`_isLoading`, `pendingRefresh`, `generation`) are read and
-/// written from that background block. Only the entry points that touch `input` (main-actor
-/// state) are annotated `@MainActor`.
+/// The app target sets `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so - like every other
+/// unannotated type in the module - this class is implicitly `@MainActor`. The scan itself still
+/// runs on a background queue, though, so the pieces that are genuinely touched from that
+/// background block are marked `nonisolated` to match how they are actually used: the lock
+/// (`stateLock`), the three flags it protects (`_isLoading`, `pendingRefresh`, `generation`), and
+/// `finishScan`, which is called directly from the background closure. `start()`, `stop()`, and
+/// `refreshNow()` stay on the main actor because they read `input`, which is main-actor state.
+/// Within this module the explicit `@MainActor` on those three is redundant (the type is already
+/// implicitly main-actor); it is kept because it also constrains the test target, which does not
+/// set `SWIFT_DEFAULT_ACTOR_ISOLATION`, so it is what pins those entry points to the main actor
+/// there.
 final class TokenStatsRefreshCoordinator {
 
     /// Injected so tests can drive the coordinator without touching `~/.claude`.
@@ -43,25 +53,31 @@ final class TokenStatsRefreshCoordinator {
 
     private var refreshTimer: Timer?
     private let queue = DispatchQueue(label: "com.claudeusage.tokenstats", qos: .utility)
-    private let stateLock = NSLock()
-    private var _isLoading = false
+    private nonisolated let stateLock = NSLock()
+    // `nonisolated(unsafe)`, not plain `nonisolated`: the latter is rejected for *mutable*
+    // stored properties ("'nonisolated' cannot be applied to mutable stored properties"),
+    // because the compiler can't verify their access is safe on its own. `stateLock` is what
+    // actually provides that safety - every read and write below is one of the paired
+    // lock/unlock sections in this file, never a bare access.
+    private nonisolated(unsafe) var _isLoading = false
 
     /// Set when a refresh request arrives while a scan is already in flight. Consumed (and
     /// cleared) exactly once, when that scan finishes, to start exactly one follow-up scan.
     /// Multiple requests arriving during the same in-flight scan collapse into this single flag
     /// rather than each queuing their own follow-up.
-    private var pendingRefresh = false
+    private nonisolated(unsafe) var pendingRefresh = false
 
     /// Bumped by `stop()`. A scan captures the generation it started under; if that no longer
     /// matches by the time the scan completes, `stop()` ran meanwhile and the result is stale
     /// (e.g. it belongs to a profile that has since been switched away from) and is discarded.
-    private var generation = 0
+    private nonisolated(unsafe) var generation = 0
 
     weak var delegate: TokenStatsRefreshCoordinatorDelegate?
     weak var input: TokenStatsInputProviding?
 
-    /// True while a scan is in flight.
-    var isLoading: Bool {
+    /// True while a scan is in flight. `nonisolated` because it only ever touches the
+    /// lock-protected state above, none of which requires the main actor.
+    nonisolated var isLoading: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
         return _isLoading
@@ -78,7 +94,18 @@ final class TokenStatsRefreshCoordinator {
     }
 
     deinit {
-        refreshTimer?.invalidate()
+        // `refreshTimer` is main-actor state, but by the time `deinit` runs there is no
+        // concurrent access to race: nothing else holds `self`. The thread `deinit` itself runs
+        // on is the real hazard - the background scan closure below strongifies `self` for its
+        // duration, so if the owner drops its reference mid-scan, the closure's local `self` can
+        // be the last one, and `deinit` then runs on the utility queue, not the main thread.
+        // `Timer.invalidate()` must be called on the thread that installed the timer, so capture
+        // it into a local (keeping it alive independent of `self`) and hop to the main queue
+        // rather than invalidating it here directly.
+        let timer = refreshTimer
+        DispatchQueue.main.async {
+            timer?.invalidate()
+        }
     }
 
     // MARK: - Lifecycle
@@ -112,6 +139,11 @@ final class TokenStatsRefreshCoordinator {
 
         stateLock.lock()
         generation += 1
+        // A refresh requested before `stop()` must not resurrect scanning after it: without
+        // this, a scan already in flight when `stop()` runs would still see `pendingRefresh` set
+        // when it finishes and start a follow-up scan - with no timer running and after the
+        // coordinator was told to stop.
+        pendingRefresh = false
         stateLock.unlock()
     }
 
@@ -158,16 +190,19 @@ final class TokenStatsRefreshCoordinator {
         }
     }
 
-    /// Runs on the background queue right after a scan completes. Clears the in-flight flag,
-    /// decides whether the result is still current (see `generation`), and - if a refresh
-    /// coalesced in while this scan was running - kicks off exactly one follow-up on the main
-    /// actor. Discarding a stale result still clears `isLoading` and still honours a pending
-    /// refresh, so a superseded scan can never wedge the coordinator.
-    private func finishScan(generation scanGeneration: Int, stats: TokenStats) {
+    /// Runs on the background queue right after a scan completes. Decides whether the result is
+    /// still current (see `generation`) and - only if it is, and a refresh coalesced in while
+    /// this scan was running - kicks off exactly one follow-up on the main actor. A stale result
+    /// never triggers a follow-up of its own: `stop()` already cleared `pendingRefresh`, and
+    /// gating on staleness here as well means a scan that finishes *between* `stop()`'s two
+    /// critical sections (bumping `generation`, then clearing `pendingRefresh`) still can't
+    /// resurrect scanning. `_isLoading` is cleared on the main actor below, right before this
+    /// method's caller would otherwise be free to start a genuinely-redundant concurrent scan;
+    /// see the note on that line for why it isn't cleared here instead.
+    private nonisolated func finishScan(generation scanGeneration: Int, stats: TokenStats) {
         stateLock.lock()
-        _isLoading = false
         let isStale = scanGeneration != generation
-        let shouldRefreshAgain = pendingRefresh
+        let shouldRefreshAgain = !isStale && pendingRefresh
         pendingRefresh = false
         stateLock.unlock()
 
@@ -176,9 +211,28 @@ final class TokenStatsRefreshCoordinator {
             if !isStale {
                 self.delegate?.tokenStatsCoordinator(self, didLoad: stats)
             }
+            // Cleared here, after delivery, rather than back in the background block above:
+            // clearing it there would open a window - between this scan finishing and its
+            // result reaching the delegate on the main actor - where an external `refreshNow()`
+            // sees the coordinator as idle and starts a second, genuinely redundant scan
+            // alongside the follow-up already queued via `pendingRefresh`. Keeping `_isLoading`
+            // true across that hop closes the window entirely.
+            self.clearIsLoadingAfterDelivery()
             if shouldRefreshAgain {
                 self.refreshNow()
             }
         }
+    }
+
+    /// `NSLock.lock()`/`unlock()` are marked unavailable from asynchronous contexts (calling them
+    /// directly inside an `async` closure is a priority-inversion risk the compiler now flags).
+    /// This wraps the pair in an ordinary synchronous, `nonisolated` function so `finishScan`'s
+    /// `Task { @MainActor in ... }` continuation above can call it without tripping that
+    /// diagnostic - calling a synchronous function from an async context is unrestricted; only
+    /// the direct lock/unlock call sites are.
+    private nonisolated func clearIsLoadingAfterDelivery() {
+        stateLock.lock()
+        _isLoading = false
+        stateLock.unlock()
     }
 }

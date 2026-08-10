@@ -43,6 +43,22 @@ private final class FlagBox {
     }
 }
 
+/// Records values in call order, so a test can assert what a *later* invocation observed - e.g.
+/// that a coalesced follow-up scan read `input` fresh rather than reusing what an earlier,
+/// already-in-flight scan captured.
+private final class CallRecorder {
+    private let lock = NSLock()
+    private var values: [Bool] = []
+
+    func record(_ value: Bool) {
+        lock.lock(); values.append(value); lock.unlock()
+    }
+
+    var recorded: [Bool] {
+        lock.lock(); defer { lock.unlock() }; return values
+    }
+}
+
 private final class RecordingDelegate: TokenStatsRefreshCoordinatorDelegate {
     var received: [TokenStats] = []
     /// Fulfilled once per delivery. `assertForOverFulfill` is left on by the caller where a
@@ -78,16 +94,19 @@ final class TokenStatsRefreshCoordinatorTests: XCTestCase {
     func testRefreshDeliversStatsToDelegate() {
         let expectation = expectation(description: "delegate called")
         let delegate = RecordingDelegate(expectation: expectation)
-        // `coordinator.input`/`delegate` are weak (matches production, where the owner holds
-        // the strong reference); `withExtendedLifetime` keeps these locals alive for the whole
-        // test rather than only until their last textual use, which under optimisation is not
-        // guaranteed to be the end of the scope.
         let input = StubInput()
-        withExtendedLifetime((input, delegate)) {
-            let coordinator = makeCoordinator(input: input, delegate: delegate) { _, _ in
-                TokenStats(allTime: 42, last7Days: 7, last30Days: 30, isAvailable: true)
-            }
+        let coordinator = makeCoordinator(input: input, delegate: delegate) { _, _ in
+            TokenStats(allTime: 42, last7Days: 7, last30Days: 30, isAvailable: true)
+        }
 
+        // `coordinator.input`/`delegate` are weak (matches production, where the owner holds the
+        // strong reference); the coordinator itself is only weakly captured by its own async
+        // continuations (`queue.async { [weak self] ... }`, `Task { @MainActor [weak self] ... }`).
+        // `withExtendedLifetime` keeps all three alive for the whole test rather than only until
+        // their last textual use, which under optimisation is not guaranteed to be the end of
+        // the scope - without it, ARC is free to release `coordinator` right after `refreshNow()`
+        // is called, and the async delivery this test waits for would never happen.
+        withExtendedLifetime((input, delegate, coordinator)) {
             coordinator.refreshNow()
 
             wait(for: [expectation], timeout: 5)
@@ -108,17 +127,16 @@ final class TokenStatsRefreshCoordinatorTests: XCTestCase {
         let delegate = RecordingDelegate(expectation: bothDelivered)
         let counter = Counter()
         let input = StubInput()
-
-        withExtendedLifetime((input, delegate)) {
-            let coordinator = makeCoordinator(input: input, delegate: delegate) { _, _ in
-                let callNumber = counter.incrementAndGet()
-                if callNumber == 1 {
-                    firstStarted.fulfill()
-                    release.wait()
-                }
-                return .unavailable
+        let coordinator = makeCoordinator(input: input, delegate: delegate) { _, _ in
+            let callNumber = counter.incrementAndGet()
+            if callNumber == 1 {
+                firstStarted.fulfill()
+                release.wait()
             }
+            return .unavailable
+        }
 
+        withExtendedLifetime((input, delegate, coordinator)) {
             coordinator.refreshNow()
             wait(for: [firstStarted], timeout: 5)
 
@@ -142,19 +160,59 @@ final class TokenStatsRefreshCoordinatorTests: XCTestCase {
     }
 
     @MainActor
+    func testCoalescedFollowUpReReadsChangedInputs() {
+        // The whole point of coalescing (rather than dropping or queuing) is that the follow-up
+        // scan reads `input` fresh. Nothing above proves that: it only proves a follow-up scan
+        // *runs*. Change an input while the first scan is parked and confirm the follow-up
+        // observes the new value, not the one the first scan captured.
+        let firstStarted = expectation(description: "first scan started")
+        let release = DispatchSemaphore(value: 0)
+        let bothDelivered = expectation(description: "first scan and its follow-up delivered")
+        bothDelivered.expectedFulfillmentCount = 2
+        let delegate = RecordingDelegate(expectation: bothDelivered)
+        let recorder = CallRecorder()
+        let input = StubInput()
+        input.countCacheTokens = true
+        let coordinator = makeCoordinator(input: input, delegate: delegate) { _, countCache in
+            recorder.record(countCache)
+            if recorder.recorded.count == 1 {
+                firstStarted.fulfill()
+                release.wait()
+            }
+            return .unavailable
+        }
+
+        withExtendedLifetime((input, delegate, coordinator)) {
+            coordinator.refreshNow()
+            wait(for: [firstStarted], timeout: 5)
+
+            // Flip the input while the first scan is parked, then coalesce a follow-up behind it.
+            input.countCacheTokens = false
+            coordinator.refreshNow()
+
+            release.signal()
+            wait(for: [bothDelivered], timeout: 5)
+
+            XCTAssertEqual(
+                recorder.recorded, [true, false],
+                "the follow-up scan must read input as it is when it starts, not as it was when the in-flight scan began"
+            )
+        }
+    }
+
+    @MainActor
     func testRefreshAfterCompletionRunsAgain() {
         // Sequential (non-overlapping) refreshes must not wedge the coordinator.
         let first = expectation(description: "first")
         let delegate = RecordingDelegate(expectation: first)
         let counter = Counter()
         let input = StubInput()
+        let coordinator = makeCoordinator(input: input, delegate: delegate) { _, _ in
+            counter.increment()
+            return .unavailable
+        }
 
-        withExtendedLifetime((input, delegate)) {
-            let coordinator = makeCoordinator(input: input, delegate: delegate) { _, _ in
-                counter.increment()
-                return .unavailable
-            }
-
+        withExtendedLifetime((input, delegate, coordinator)) {
             coordinator.refreshNow()
             wait(for: [first], timeout: 5)
 
@@ -176,13 +234,12 @@ final class TokenStatsRefreshCoordinatorTests: XCTestCase {
         let done = expectation(description: "delivered")
         let delegate = RecordingDelegate(expectation: done)
         let counter = Counter()
+        let coordinator = makeCoordinator(input: input, delegate: delegate) { _, _ in
+            counter.increment()
+            return .unavailable
+        }
 
-        withExtendedLifetime((input, delegate)) {
-            let coordinator = makeCoordinator(input: input, delegate: delegate) { _, _ in
-                counter.increment()
-                return .unavailable
-            }
-
+        withExtendedLifetime((input, delegate, coordinator)) {
             coordinator.refreshNow()
             wait(for: [done], timeout: 5)
 
@@ -198,13 +255,12 @@ final class TokenStatsRefreshCoordinatorTests: XCTestCase {
         let done = expectation(description: "delivered")
         let delegate = RecordingDelegate(expectation: done)
         let box = FlagBox()
+        let coordinator = makeCoordinator(input: input, delegate: delegate) { _, countCache in
+            box.set(countCache)
+            return .unavailable
+        }
 
-        withExtendedLifetime((input, delegate)) {
-            let coordinator = makeCoordinator(input: input, delegate: delegate) { _, countCache in
-                box.set(countCache)
-                return .unavailable
-            }
-
+        withExtendedLifetime((input, delegate, coordinator)) {
             coordinator.refreshNow()
             wait(for: [done], timeout: 5)
 
@@ -222,16 +278,15 @@ final class TokenStatsRefreshCoordinatorTests: XCTestCase {
         let primed = expectation(description: "primed refresh ran")
         let input = StubInput()
         let delegate = RecordingDelegate()
+        let coordinator = TokenStatsRefreshCoordinator(interval: 300) { _, _ in
+            counter.increment()
+            primed.fulfill()
+            return .unavailable
+        }
+        coordinator.input = input
+        coordinator.delegate = delegate
 
-        withExtendedLifetime((input, delegate)) {
-            let coordinator = TokenStatsRefreshCoordinator(interval: 300) { _, _ in
-                counter.increment()
-                primed.fulfill()
-                return .unavailable
-            }
-            coordinator.input = input
-            coordinator.delegate = delegate
-
+        withExtendedLifetime((input, delegate, coordinator)) {
             coordinator.start()
             wait(for: [primed], timeout: 5)
 
@@ -248,28 +303,30 @@ final class TokenStatsRefreshCoordinatorTests: XCTestCase {
         let input = StubInput()
         let delegate = RecordingDelegate()
 
-        withExtendedLifetime((input, delegate)) {
-            let coordinator = TokenStatsRefreshCoordinator(interval: interval) { _, _ in
-                counter.increment()
-                return .unavailable
-            }
-            coordinator.input = input
-            coordinator.delegate = delegate
+        // Two start() calls contribute exactly two immediate scans (one per call), plus exactly
+        // one tick once the interval elapses if start() correctly leaves only one timer running.
+        // Rather than sampling the counter at one arbitrary point in time - which either requires
+        // the tick to land inside an unrealistically tight window (flaky on a loaded machine) or
+        // lets a second timer's coalesced tick land *after* the sample and pass anyway - use an
+        // expectation with a hard fulfillment ceiling: a fourth load (from a second, un-invalidated
+        // timer) over-fulfills and fails the test immediately, whenever it happens to occur.
+        let loadCount = expectation(description: "two immediate scans plus one tick from a single timer")
+        loadCount.expectedFulfillmentCount = 3
+        loadCount.assertForOverFulfill = true
 
+        let coordinator = TokenStatsRefreshCoordinator(interval: interval) { _, _ in
+            counter.increment()
+            loadCount.fulfill()
+            return .unavailable
+        }
+        coordinator.input = input
+        coordinator.delegate = delegate
+
+        withExtendedLifetime((input, delegate, coordinator)) {
             coordinator.start()
             coordinator.start() // must invalidate the first timer, not run two in parallel
 
-            // Two start() calls contribute exactly two immediate scans (whether both run right
-            // away, or the second coalesces into one guaranteed follow-up - either way the
-            // total is two, never more, never fewer). If start() left a second timer running
-            // alongside the first, this window (1.5x the interval) contains one tick from each
-            // of the two timers instead of one tick from a single timer, so the count would
-            // exceed 3.
-            let settle = expectation(description: "settle past one tick")
-            DispatchQueue.main.asyncAfter(deadline: .now() + interval * 1.5) {
-                settle.fulfill()
-            }
-            wait(for: [settle], timeout: 5)
+            wait(for: [loadCount], timeout: 5)
 
             XCTAssertEqual(
                 counter.value, 3,
@@ -283,5 +340,91 @@ final class TokenStatsRefreshCoordinatorTests: XCTestCase {
     func testStopBeforeStartDoesNotCrash() {
         let coordinator = TokenStatsRefreshCoordinator(interval: 300) { _, _ in .unavailable }
         coordinator.stop()
+    }
+
+    // MARK: - stop() fencing
+
+    @MainActor
+    func testPendingRefreshDoesNotSurviveStop() {
+        // Regression test: a refreshNow() that coalesces while a scan is in flight must not
+        // resurrect scanning once stop() has ended the coordinator's lifecycle.
+        //
+        // Sequence: start a scan (generation 0), park it; call refreshNow() so it sets the
+        // pending flag; call stop() (bumps to generation 1); release the parked scan. Before the
+        // fix, finishScan still saw the pending flag and started a follow-up scan with no timer
+        // running, delivering stats to the delegate after the coordinator was stopped.
+        let firstStarted = expectation(description: "first scan started")
+        let release = DispatchSemaphore(value: 0)
+        let counter = Counter()
+        let input = StubInput()
+        let delegate = RecordingDelegate()
+        // No delivery, and no second load, are expected. Inverted expectations catch either one
+        // regardless of when it lands, rather than sampling state once after a fixed delay.
+        let noDelivery = expectation(description: "no delivery after stop()")
+        noDelivery.isInverted = true
+        delegate.expectation = noDelivery
+
+        let coordinator = makeCoordinator(input: input, delegate: delegate) { _, _ in
+            let callNumber = counter.incrementAndGet()
+            if callNumber == 1 {
+                firstStarted.fulfill()
+                release.wait()
+            }
+            return .unavailable
+        }
+
+        withExtendedLifetime((input, delegate, coordinator)) {
+            coordinator.refreshNow() // scan at generation 0, parks in the loader
+            wait(for: [firstStarted], timeout: 5)
+
+            coordinator.refreshNow() // sets pendingRefresh while the scan is in flight
+            coordinator.stop()       // bumps to generation 1; must also clear pendingRefresh
+
+            release.signal()        // let the parked scan finish
+
+            wait(for: [noDelivery], timeout: 1)
+
+            XCTAssertEqual(
+                counter.value, 1,
+                "stop() must prevent the coalesced follow-up scan from ever running"
+            )
+            XCTAssertTrue(delegate.received.isEmpty, "no stats may reach the delegate once stopped")
+        }
+    }
+
+    @MainActor
+    func testStopDiscardsResultFromScanStartedBeforeIt() {
+        // Coverage gap: nothing previously proved the generation fence actually discards a
+        // pre-stop() result end-to-end (as opposed to just tracking staleness internally). Park
+        // a scan, stop() before it finishes, release it, and confirm the delegate gets nothing -
+        // with no pending refresh involved this time, isolating the fence itself.
+        let started = expectation(description: "scan started")
+        let release = DispatchSemaphore(value: 0)
+        let input = StubInput()
+        let delegate = RecordingDelegate()
+        let noDelivery = expectation(description: "no delivery of the stale result")
+        noDelivery.isInverted = true
+        delegate.expectation = noDelivery
+
+        let coordinator = makeCoordinator(input: input, delegate: delegate) { _, _ in
+            started.fulfill()
+            release.wait()
+            return TokenStats(allTime: 99, last7Days: 9, last30Days: 90, isAvailable: true)
+        }
+
+        withExtendedLifetime((input, delegate, coordinator)) {
+            coordinator.refreshNow()
+            wait(for: [started], timeout: 5)
+
+            coordinator.stop()
+            release.signal()
+
+            wait(for: [noDelivery], timeout: 1)
+
+            XCTAssertTrue(
+                delegate.received.isEmpty,
+                "a result from a scan that started before stop() must be discarded, not delivered"
+            )
+        }
     }
 }
