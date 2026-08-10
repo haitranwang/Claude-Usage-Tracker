@@ -245,6 +245,37 @@ final class TokenStatsExclusiveModeTests: XCTestCase {
         XCTAssertFalse(stats.isAvailable, "no JSONL exists to back the 7D window, so the cache can't vouch for it")
     }
 
+    func testExclusiveAllTimeAvailableFromJSONLWhenCacheMissing() {
+        // Defect 1: with only all-time enabled, a missing cache must not make the frame
+        // unavailable - all-time falls back to the full JSONL input+output sum, exactly like the
+        // cache-inclusive path's `testMissingCacheFallsBackToFullJSONLSum`.
+        let missingStatsURL = tempDir.appendingPathComponent("no-such-cache.json")
+        let dir = writeJSONL([
+            (day: day(offsetFromToday: -10), input: 100, output: 50, cacheRead: 200, cacheCreate: 10)
+        ])
+
+        let stats = load([.tokensAllTime], statsURL: missingStatsURL, projectsDir: dir)
+
+        XCTAssertTrue(stats.isAvailable, "no cache, but JSONL parsed - all-time falls back to the full JSONL sum")
+        XCTAssertEqual(stats.allTime, 150, "100 + 50 io, cache tokens excluded")
+    }
+
+    func testExclusiveUnavailableWhenWindowEnabledAlongsideAllTimeButNoJSONL() {
+        // Defect 2: a valid cache vouches only for all-time (it comes from modelUsage); with a
+        // window frame also enabled and no JSONL to back it, the whole result must be
+        // unavailable rather than reporting all-time alongside a confident 0 for the window.
+        let cutoff = day(offsetFromToday: -2)
+        let statsURL = writeStatsCache("""
+        { "modelUsage": {}, "dailyModelTokens": [], "lastComputedDate": "\(cutoff)" }
+        """)
+        let emptyProjectsDir = tempDir.appendingPathComponent("projects-empty")
+        try! FileManager.default.createDirectory(at: emptyProjectsDir, withIntermediateDirectories: true)
+
+        let stats = load([.tokensAllTime, .tokens7Days], statsURL: statsURL, projectsDir: emptyProjectsDir)
+
+        XCTAssertFalse(stats.isAvailable, "no JSONL to back the enabled 7D window, despite a valid cache")
+    }
+
     func testInclusiveModeStillDefaultsOn() {
         // The parameter defaults to true, so an unmigrated call site keeps CLI-matching numbers.
         let cutoff = day(offsetFromToday: -1)

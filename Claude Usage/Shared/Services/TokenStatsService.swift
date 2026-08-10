@@ -271,13 +271,20 @@ struct TokenStatsService {
         }
 
         // Unlike the inclusive path, a readable cache here vouches only for all-time (it comes
-        // from `modelUsage`). The window frames come entirely from JSONL, so a cache that parsed
-        // fine says nothing about them - only `anyJSONLParsed` can. Without this split, a valid
-        // cache alongside an unreadable/empty projects directory would report a confident zero
-        // for an enabled window instead of `.unavailable`.
-        let allTimeEnabled = tokenFrames.contains(.tokensAllTime)
+        // from `modelUsage`); the window frames come entirely from JSONL, so a cache that parsed
+        // fine says nothing about them. That means each frame's availability has to be judged
+        // against its own backing source rather than by one shared condition:
+        //   - any window frame enabled: JSONL must have parsed something, full stop. Whatever
+        //     all-time's own status is, a window frame backed by nothing must not render a
+        //     confident zero.
+        //   - only all-time enabled: either a readable cache or a JSONL parse suffices, since
+        //     all-time falls back to the full JSONL sum when the cache has no usable cutoff (see
+        //     `readCache`'s comment on why it reports `available: false` in that case).
+        // The inclusive path's guard (`cacheAvailable || anyJSONLParsed`) doesn't need this split:
+        // there, a readable cache genuinely backs the windows too (`dailyModelTokens`), so a
+        // cache alone is enough regardless of which frames are enabled.
         let windowFrameEnabled = maxWindow > 0
-        guard (allTimeEnabled && cacheAvailable) || (windowFrameEnabled && anyJSONLParsed) else {
+        guard windowFrameEnabled ? anyJSONLParsed : (cacheAvailable || anyJSONLParsed) else {
             return .unavailable
         }
 
