@@ -81,7 +81,13 @@ enum Constants {
     }
 
     // Claude Code paths
-    enum ClaudePaths {
+    //
+    // `nonisolated`: every member here is a pure computed property over `ProcessInfo`/
+    // `FileManager`, touching no shared or main-actor state. `TokenStatsService` (itself
+    // `nonisolated` so it can run its JSONL scan off the main actor) reads `statsCacheFile` and
+    // `projectsDirectory` as default parameter values, which is a cross-isolation-domain
+    // reference unless this type is nonisolated too.
+    nonisolated enum ClaudePaths {
         /// Get the REAL user home directory (not sandboxed container)
         static var homeDirectory: URL {
             // Try to get real home from environment variable

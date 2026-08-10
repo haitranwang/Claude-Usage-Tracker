@@ -10,7 +10,14 @@ class MenuBarManager: NSObject, ObservableObject {
     @Published private(set) var status: ClaudeStatus = .unknown
     @Published private(set) var apiUsage: APIUsage?
     @Published private(set) var tokenStats: TokenStats?
-    private let tokenStatsService = TokenStatsService()
+    // Owns its own service instance and its own 300s timer, independent of the 30s usage
+    // refresh loop - see TokenStatsRefreshCoordinator's header for why they're split apart.
+    private lazy var tokenStatsCoordinator: TokenStatsRefreshCoordinator = {
+        let coordinator = TokenStatsRefreshCoordinator()
+        coordinator.delegate = self
+        coordinator.input = self
+        return coordinator
+    }()
     @Published private(set) var isRefreshing: Bool = false
 
     // Error tracking for stale data / credential banners
@@ -144,6 +151,7 @@ class MenuBarManager: NSObject, ObservableObject {
                     colorMode: config.colorMode,
                     singleColorHex: config.singleColorHex,
                     showIconNames: config.showIconNames,
+                    countCacheTokens: config.countCacheTokens,
                     metrics: config.metrics.map { metric in
                         var updatedMetric = metric
                         updatedMetric.isEnabled = false
@@ -214,6 +222,12 @@ class MenuBarManager: NSObject, ObservableObject {
         // Start auto-refresh timer with active profile's interval
         startAutoRefresh()
 
+        // Start the token-stats refresh coordinator on its own 300s cadence, independent of
+        // the 30s usage refresh above. Started once, here, alongside the manager's other
+        // long-lived timers - not inside startAutoRefresh(), which also runs on every
+        // interval change and would otherwise restart this timer too.
+        tokenStatsCoordinator.start()
+
         // Start auto-start session service (5-minute cycle for all profiles)
         autoStartService.start()
 
@@ -266,6 +280,7 @@ class MenuBarManager: NSObject, ObservableObject {
         ShortcutManager.shared.stopListening()
         refreshTimer?.invalidate()
         refreshTimer = nil
+        tokenStatsCoordinator.stop()
         networkMonitor.stopMonitoring()
         autoStartService.stop()
         cancellables.removeAll()  // Clean up Combine subscriptions
@@ -411,6 +426,11 @@ class MenuBarManager: NSObject, ObservableObject {
         } else {
             LoggingService.shared.log("MenuBarManager: Skipping refresh for profile without usage credentials")
         }
+
+        // 6. Token stats are local-file based (not gated on API credentials) and the new
+        // profile's icon config may enable different frames or a different countCacheTokens
+        // setting, so re-read inputs and refresh now rather than waiting out the 300s timer.
+        tokenStatsCoordinator.refreshNow()
     }
 
     private func recreatePopover() {
@@ -458,6 +478,7 @@ class MenuBarManager: NSObject, ObservableObject {
                 colorMode: config.colorMode,
                 singleColorHex: config.singleColorHex,
                 showIconNames: config.showIconNames,
+                countCacheTokens: config.countCacheTokens,
                 metrics: config.metrics.map { metric in
                     var updatedMetric = metric
                     updatedMetric.isEnabled = false
@@ -858,6 +879,7 @@ class MenuBarManager: NSObject, ObservableObject {
                 self.lastRefreshTriggerTime = Date()
 
                 self.refreshUsage()
+                self.tokenStatsCoordinator.refreshNow()
             }
         }
     }
@@ -1234,6 +1256,7 @@ class MenuBarManager: NSObject, ObservableObject {
                 colorMode: config.colorMode,
                 singleColorHex: config.singleColorHex,
                 showIconNames: config.showIconNames,
+                countCacheTokens: config.countCacheTokens,
                 metrics: config.metrics.map { metric in
                     var updatedMetric = metric
                     updatedMetric.isEnabled = false
@@ -1440,19 +1463,6 @@ class MenuBarManager: NSObject, ObservableObject {
 
                     LoggingService.shared.log("MenuBarManager: Failed to fetch API usage - [\(appError.code.rawValue)] \(appError.message)")
                 }
-            }
-
-            // Load Claude Code token stats (local files, not a network call).
-            // Only the enabled frames are computed, to bound the JSONL scan.
-            let enabledTokenFrames: Set<MenuBarMetricType> = await MainActor.run {
-                let cfg = self.profileManager.activeProfile?.iconConfig ?? .default
-                return Set(cfg.enabledMetrics.map { $0.metricType }.filter { $0.isTokenMetric })
-            }
-            let loadedTokenStats = enabledTokenFrames.isEmpty
-                ? TokenStats.unavailable
-                : self.tokenStatsService.load(enabledFrames: enabledTokenFrames)
-            await MainActor.run {
-                self.tokenStats = loadedTokenStats
             }
 
             // Clear loading state
@@ -1971,5 +1981,28 @@ extension MenuBarManager: NSWindowDelegate {
                 githubPromptWindow = nil
             }
         }
+    }
+}
+
+// MARK: - Token stats refresh
+
+// `TokenStatsInputProviding` is read synchronously on the main thread by `refreshNow()`, so
+// these accessors stay main-actor isolated like the rest of the class. If the compiler objects
+// to the conformance, annotate the extension `@MainActor` rather than making the properties
+// `nonisolated` - they read the active profile, which is main-actor state.
+extension MenuBarManager: TokenStatsInputProviding {
+    var enabledTokenFrames: Set<MenuBarMetricType> {
+        let cfg = profileManager.activeProfile?.iconConfig ?? .default
+        return Set(cfg.enabledMetrics.map { $0.metricType }.filter { $0.isTokenMetric })
+    }
+
+    var countCacheTokens: Bool {
+        (profileManager.activeProfile?.iconConfig ?? .default).countCacheTokens
+    }
+}
+
+extension MenuBarManager: TokenStatsRefreshCoordinatorDelegate {
+    func tokenStatsCoordinator(_ coordinator: TokenStatsRefreshCoordinator, didLoad stats: TokenStats) {
+        tokenStats = stats
     }
 }

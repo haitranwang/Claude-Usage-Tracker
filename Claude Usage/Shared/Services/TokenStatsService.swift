@@ -23,7 +23,15 @@ import Foundation
 /// are read from the cache (cheap), and only days after it are recomputed from
 /// `~/.claude/projects/**/*.jsonl` (comparatively expensive). To bound that JSONL work, only the
 /// time frames present in `enabledFrames` are scanned for; the rest are left at 0.
-struct TokenStatsService {
+///
+/// `nonisolated`: the app target sets `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so without
+/// this the type (init, `load`, its private helpers and statics) would be implicitly main-actor.
+/// `TokenStatsRefreshCoordinator`'s default `load` closure is `@Sendable` and calls this from a
+/// background queue, which produced two "main actor-isolated ... in a synchronous nonisolated
+/// context" warnings at the closure's default value - hard errors under Swift 6. Nothing here
+/// actually touches main-actor state, so marking the whole type `nonisolated` is correct, not a
+/// workaround.
+nonisolated struct TokenStatsService {
 
     /// Which token kinds a total counts.
     ///

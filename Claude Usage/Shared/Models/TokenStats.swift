@@ -1,7 +1,13 @@
 import Foundation
 
 /// Aggregated Claude Code CLI token totals (input + output, excluding cache).
-struct TokenStats: Codable, Equatable {
+///
+/// `nonisolated`: a plain value type with no shared mutable state, safe to touch from any
+/// isolation domain. `TokenStatsService.load` (itself `nonisolated` so it can run its JSONL scan
+/// off the main actor) returns `.unavailable` from within helpers that run on a background
+/// queue, which is a cross-isolation-domain reference to this type's static property unless it
+/// is nonisolated too.
+nonisolated struct TokenStats: Codable, Equatable {
     let allTime: Int
     let last7Days: Int
     let last30Days: Int

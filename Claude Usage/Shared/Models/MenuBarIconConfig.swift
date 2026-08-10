@@ -8,7 +8,13 @@
 import Foundation
 
 /// Types of metrics that can be displayed in the menu bar
-enum MenuBarMetricType: String, Codable, CaseIterable, Identifiable {
+///
+/// `nonisolated`: a plain `String`-backed enum with only pure computed properties, safe to touch
+/// from any isolation domain. `TokenStatsService.load` (itself `nonisolated` so it can run its
+/// JSONL scan off the main actor) filters on `isTokenMetric` from within helpers that run on a
+/// background queue, which is a cross-isolation-domain reference unless this type is nonisolated
+/// too.
+nonisolated enum MenuBarMetricType: String, Codable, CaseIterable, Identifiable {
     case session
     case week
     case api
