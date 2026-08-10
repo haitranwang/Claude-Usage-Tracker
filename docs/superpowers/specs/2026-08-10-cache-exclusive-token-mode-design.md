@@ -21,8 +21,8 @@ that answers the latter.
 | Question | Decision |
 |---|---|
 | How are the two modes exposed? | One global toggle; the three cards keep their meaning slots |
-| Cost of scanning JSONL every refresh? | Accepted, mitigated by a slower dedicated cadence |
-| 30D is missing ~5/30 days of data | Show it plainly, no marker on the menu bar |
+| Cost of scanning JSONL every refresh? | Cut ~15x by a byte-level rewrite, landed first, separately |
+| Dedicated slower cadence for token stats? | Yes, 300s — now headroom rather than rescue |
 | Persistent app-side ledger? | **No** — rejected as not worth the complexity |
 
 ## Constraints discovered (measured, not assumed)
@@ -31,34 +31,81 @@ Scan cost on this machine, mirroring `TokenStatsService.scanJSONL` exactly (Swif
 
 | Window | Time | Bytes read | Files |
 |---|---|---|---|
-| 1 day | 2.07s | 46.7 MB | 36 |
-| 7 days | 6.47s | 140.8 MB | 335 |
-| 30 days | 15.99s | 342.3 MB | 1,174 |
+| 1 day | 2.1–2.6s | 47–61 MB | 36–77 |
+| 7 days | 6.5–8.5s | 141–155 MB | 335–378 |
+| 30 days | 16–20s | 342–356 MB | 1,174–1,216 |
 
-These grow with usage; they are a floor, not a ceiling.
+Ranges, not points: the corpus grew measurably across a few hours of measurement. These are a
+floor, not a ceiling.
 
-**Neither data source is authoritative.** Comparing JSONL against `stats-cache.json` per day:
+**JSONL is the authoritative source; `stats-cache.json` is a cached projection of it.** Bucketing
+JSONL lines by the UTC date prefix of `timestamp` — which is what both the CLI and this app do —
+reproduces `dailyModelTokens` **exactly, to the token, on all 29 days where both have data**. Zero
+days differ by more than 2%.
 
-| Day | JSONL (io+cache) | stats-cache | Ratio |
-|---|---|---|---|
-| 08-08 | 557,858,334 | 464,650,349 | 120% |
-| 08-07 | 422,917,895 | 516,125,880 | 82% |
-| 08-03 | 1,069,226,587 | 866,840,041 | 123% |
-| 08-02 | 6,332,559 | 371,372,939 | 2% |
-| 07-15 | 29,273,398 | 101,551,147 | 29% |
+Coverage of the last 30 days:
 
-Two independent causes, in opposite directions:
+| | Days |
+|---|---|
+| Both sources, byte-identical | 25 |
+| JSONL only (today; CLI hasn't computed it yet) | 1 |
+| Cache only (JSONL deleted) | **0** |
+| No activity in either | 4 |
 
-- **JSONL under-reports old days** — Claude Code's retention cleanup (`cleanupPeriodDays`,
-  default 30) deletes session logs. Oldest surviving file here is 2026-07-13; a 30-day window
-  needs 2026-07-12.
-- **stats-cache under-reports recent days** — the CLI computes incrementally and advances
-  `lastComputedDate`; a day computed mid-way never gets its remainder merged, so JSONL can exceed
-  it by 20%+.
+Retention cleanup has removed JSONL for only five days — 2026-06-09 through 06-18, all more than
+52 days old and outside every window the app offers. Oldest surviving JSONL content is 2026-06-22,
+i.e. ~49 days of history, comfortably more than the 30-day window needs.
 
-Consequence: "matching the CLI" is the goal, not absolute accuracy. No available number is exact.
+> **Correction.** An earlier draft claimed the two sources disagreed by ±20% and that 30D was
+> missing ~5/30 days. That was an analysis error: the comparison bucketed JSONL by local time
+> (UTC+7) while both the CLI and the app bucket by UTC date. Re-run with UTC bucketing, the
+> disagreement vanishes entirely. Cache-exclusive 30D is complete and exact — no caveat needed,
+> and the decision to display it unqualified is simply correct rather than a compromise.
 
 ## Design
+
+### 0. Prerequisite: byte-level scanner rewrite (ships first, separately)
+
+Profiling the 7-day scan shows only **5% of the time is disk I/O**. The rest is Swift String and
+Foundation overhead:
+
+| Stage | Share | Problem |
+|---|---|---|
+| `contains("\"usage\"")` prefilter | **36.8%** | `String.contains` is grapheme-aware |
+| `split(separator: "\n")` | **29.7%** | 57k Substrings; holds the whole 19.8 MB String |
+| `DateFormatter` | **16.9%** | 31k parses |
+| `JSONDecoder` + `.convertFromSnakeCase` | 10.9% | transforms every key of every object |
+| read file | 5.0% | |
+| enumerate + stat | 0.2% | |
+
+The comment calling the prefilter "cheap … before paying for JSON decoding" is inverted: it costs
+3.4x the decoding it exists to avoid. And the date handling is a round trip to nowhere —
+`dayFromTimestamp` parses `"2026-08-10"` into a `Date` so that `dayKey` can format it back into
+`"2026-08-10"`, through two `DateFormatter` calls. `"yyyy-MM-dd"` sorts lexicographically in
+timestamp order, so plain string comparison replaces both.
+
+Four changes, no behavior change:
+
+1. `Data(contentsOf:options:.mappedIfSafe)` instead of `String(contentsOf:)`
+2. split lines on byte `0x0A` and search the `"usage"` needle over UTF-8 bytes
+3. compare `"yyyy-MM-dd"` prefixes as strings; delete per-line `DateFormatter` use
+4. explicit `CodingKeys` instead of `.convertFromSnakeCase`
+
+Measured on the same corpus, asserting identical per-day output:
+
+| Window | Before | After | Speedup |
+|---|---|---|---|
+| 7 days | 8.46s | **0.55s** | 15.3x |
+| 30 days | 20.01s | **2.84s** | 7.0x |
+
+This lands as its own change with a test proving per-day output is unchanged, before any feature
+work. It benefits the shipped cache-inclusive mode too.
+
+Equivalence must be asserted on **completed days only** — today's JSONL is being appended to while
+the test runs, so a naive before/after comparison races the writer and reports a phantom mismatch.
+
+The static `DateFormatter` is also not thread-safe; removing per-line use of it clears the way for
+parallelising the scan later, which is the obvious next lever if it is ever needed.
 
 ### 1. Semantics and data sources
 
@@ -76,9 +123,10 @@ paths, not one path with a flag.
 ALL keeps its hybrid shape in both modes so it never lags behind 7D. When 7D or 30D is enabled,
 ALL's "JSONL after cutoff" days are a subset of the window already being scanned — no second pass.
 
-Accepted asymmetry: with cache off, ALL comes from `modelUsage` while the windows come purely from
-JSONL. On days whose JSONL was deleted, the windows under-count and ALL does not. This preserves
-`ALL >= 30D >= 7D` and is the more accurate arrangement available.
+With cache off, ALL comes from `modelUsage` while the windows come purely from JSONL. Since JSONL
+reproduces the cache exactly over the retained period, the two agree; the only divergence is
+history older than JSONL retention (>49 days here), which ALL includes and the windows never
+reach anyway. `ALL >= 30D >= 7D` holds.
 
 Refactor `scanJSONL` to take an explicit range and token kind rather than threading a cutoff
 through the loop:
@@ -115,12 +163,17 @@ TokenStatsRefreshCoordinator
 Immediate recompute (not waiting for the next tick) on: app start, toggle change, token-card
 enable/disable, and user-triggered manual refresh.
 
-`isLoading` is load-bearing, not defensive padding: at 16s and growing, a 30D scan will eventually
-outlast its own interval, and overlapping scans each hold hundreds of MB.
+`isLoading` stays even though section 0 makes a 30D scan 2.84s: cost grows with the corpus, and an
+overlapping pair of scans is a failure mode worth one boolean.
 
-This also fixes an existing performance bug: even in cache-inclusive mode today, the delta scan
-covers every day after `lastComputedDate` — currently 36 files / 46.7 MB / 2.07s **every 30
-seconds**. Moving to a 5-minute cadence cuts that tenfold for the shipped mode too.
+The 300s cadence is now **headroom, not rescue**. With the byte-level scanner, a 7-day scan costs
+0.55s — running it every 30 seconds would be 1.8% duty cycle, already four times cheaper than what
+the shipped cache-inclusive mode costs today (2.07s per 30s). 300s is chosen so the margin holds as
+the corpus grows, not because the scan is expensive.
+
+Moving off the 30-second loop also fixes an existing performance bug on its own: even in
+cache-inclusive mode today, the delta scan covers every day after `lastComputedDate` — currently
+36 files / 46.7 MB / 2.07s **every 30 seconds**.
 
 Remove the inline load at `MenuBarManager.swift:1445-1456`. That file is 1,975 lines; extracting a
 small focused type matches the structure already in place.
@@ -159,11 +212,8 @@ counted, and the toggle's own caption carries that explanation. They stay plain 
 the enum, not mode-aware: `description` is a computed property on `MenuBarMetricType`, which has no
 access to profile config, and threading config into it to vary one clause is not worth it.
 
-Because the menu bar carries no marker for 30D's missing days, the caveat lives in the 30D
-description string, where it appears in Settings only:
-
-> 30 Days — Claude Code tokens, last 30 days. With cache off, older days may be missing because
-> Claude Code deletes its own JSONL logs.
+No caveat string is needed for 30D. The earlier draft added one on the belief that 30D was missing
+days; measurement showed it is complete (see the Correction above), so the description stays plain.
 
 ### 4. Testing
 
@@ -172,33 +222,45 @@ The highest-value test covers the easiest mistake: with cache off, JSONL lines *
 skipped as already folded into `dailyModelTokens`. An implementation that reuses the existing
 filter silently under-counts most of the window, and no current test catches it.
 
-| Test | Asserts |
-|---|---|
-| `exclusiveWindowCountsDaysBeforeCutoff` | 7D with cache off counts days ≤ cutoff from JSONL |
-| `exclusiveModeExcludesCacheTokens` | a pure cache-read line (io = 0) contributes 0 |
-| `exclusiveAllTimeUsesModelUsageIO` | ALL sums `inputTokens + outputTokens` only |
-| `inclusiveModeUnchanged` | the 10 existing tests pass with expectations untouched |
-| `configDecodesMissingToggleAsTrue` | legacy profile JSON yields `countCacheTokens == true` |
-| `coordinatorSkipsTickWhileScanning` | `isLoading` prevents overlapping scans |
+| Test | Asserts | Phase |
+|---|---|---|
+| `byteScannerMatchesStringScanner` | identical per-day output, completed days only | 0 |
+| `scannerHandlesFileWithoutTrailingNewline` | last line still counted when the file lacks `\n` | 0 |
+| `scannerSkipsLinesWithoutUsage` | needle search does not misfire mid-token | 0 |
+| `exclusiveWindowCountsDaysBeforeCutoff` | 7D with cache off counts days ≤ cutoff from JSONL | 1 |
+| `exclusiveModeExcludesCacheTokens` | a pure cache-read line (io = 0) contributes 0 | 1 |
+| `exclusiveAllTimeUsesModelUsageIO` | ALL sums `inputTokens + outputTokens` only | 1 |
+| `inclusiveModeUnchanged` | the 10 existing tests pass with expectations untouched | 1 |
+| `configDecodesMissingToggleAsTrue` | legacy profile JSON yields `countCacheTokens == true` | 3 |
+| `coordinatorSkipsTickWhileScanning` | `isLoading` prevents overlapping scans | 2 |
 
 The 10 existing `TokenStatsServiceTests` must not be edited — they are the safety net proving
-cache-inclusive behavior is untouched.
+cache-inclusive behavior is untouched, and they are what makes phase 0 safe to land on its own.
+
+Phase 0's byte-level rewrite is where off-by-one bugs live: a file with no trailing newline, an
+empty file, a line whose final byte is the closing brace. Those cases get explicit tests rather
+than relying on the corpus happening to contain them.
 
 Timers are not tested directly (time-based tests are flaky). `refresh()` is separately callable so
 the re-entrancy guard is testable; the thin `Timer` wiring is left uncovered.
 
 ## Explicitly out of scope
 
-- **Persistent app-side daily ledger.** Would make 30D exact going forward and cut refresh to
-  milliseconds by tail-reading appended bytes, and would preserve history the CLI deletes.
-  Rejected: not worth the durable state. Revisit if the 5-minute scan becomes painful or 30D
-  accuracy starts to matter.
+- **Persistent app-side daily ledger.** Would cut refresh to milliseconds by tail-reading appended
+  bytes and would preserve history past Claude Code's retention. Rejected: the byte-level rewrite
+  already gets 7D to 0.55s without any durable state, which removes the motivation. Revisit only
+  if the corpus grows enough to make even the fast scan painful.
+- **Parallelising the scan across files.** Unnecessary at 0.55s. Phase 0 removes the shared
+  `DateFormatter` that would have made it unsafe, so the door stays open.
 - **Separate metric cards per mode** (6 cards). Rejected in favor of one toggle.
 - **Configurable token refresh interval.** Fixed 300s constant.
-- **Any marker on the menu bar for approximate 30D.** Deliberately declined.
 
-## Known limitation, accepted
+## Known limitations, accepted
 
-With cache off, 30D under-reports by roughly 5 days out of 30 today, and worsens as retention
-cleanup runs. It is displayed without qualification on the menu bar by choice. The Settings
-description is the only place this is disclosed.
+- **Scan cost grows with usage.** Every figure here is a floor; the corpus grew measurably during
+  a few hours of measurement. The 300s cadence and `isLoading` guard exist to absorb that.
+- **`mtime`-based file skipping can under-scan** if a file's modification time is reset by
+  something other than the CLI. Pre-existing behavior, documented in the code, unchanged here.
+- **History older than JSONL retention is only visible in ALL**, which reads `modelUsage`. The
+  windows cannot reach back that far, but they never need to — retention here is ~49 days against
+  a 30-day maximum window.
