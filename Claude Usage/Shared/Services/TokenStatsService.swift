@@ -25,6 +25,16 @@ import Foundation
 /// time frames present in `enabledFrames` are scanned for; the rest are left at 0.
 struct TokenStatsService {
 
+    /// Which token kinds a total counts.
+    ///
+    /// `.all` is what `claude` reports and what `dailyModelTokens` stores since CLI 2.1.221.
+    /// `.inputOutputOnly` is the pre-2.1.221 meaning, kept available because cache reads are
+    /// ~95% of `.all` and bill at a fraction of input tokens.
+    enum TokenKind {
+        case all
+        case inputOutputOnly
+    }
+
     // MARK: - stats-cache.json decoding
 
     private struct Cache: Decodable {
@@ -34,9 +44,12 @@ struct TokenStatsService {
             let cacheReadInputTokens: Int?
             let cacheCreationInputTokens: Int?
 
-            var total: Int {
-                (inputTokens ?? 0) + (outputTokens ?? 0)
-                    + (cacheReadInputTokens ?? 0) + (cacheCreationInputTokens ?? 0)
+            func amount(counting kind: TokenKind) -> Int {
+                let io = (inputTokens ?? 0) + (outputTokens ?? 0)
+                switch kind {
+                case .inputOutputOnly: return io
+                case .all: return io + (cacheReadInputTokens ?? 0) + (cacheCreationInputTokens ?? 0)
+                }
             }
         }
         struct Daily: Decodable {
@@ -72,9 +85,12 @@ struct TokenStatsService {
                     case cacheCreationInputTokens = "cache_creation_input_tokens"
                 }
 
-                var total: Int {
-                    (inputTokens ?? 0) + (outputTokens ?? 0)
-                        + (cacheReadInputTokens ?? 0) + (cacheCreationInputTokens ?? 0)
+                func amount(counting kind: TokenKind) -> Int {
+                    let io = (inputTokens ?? 0) + (outputTokens ?? 0)
+                    switch kind {
+                    case .inputOutputOnly: return io
+                    case .all: return io + (cacheReadInputTokens ?? 0) + (cacheCreationInputTokens ?? 0)
+                    }
                 }
             }
             let usage: Usage?
@@ -130,7 +146,7 @@ struct TokenStatsService {
         let tokenFrames = enabledFrames.filter { $0.isTokenMetric }
         guard !tokenFrames.isEmpty else { return .unavailable }
 
-        let (cacheAllTime, cacheDaily, lastComputed, cacheAvailable) = readCache(from: statsURL)
+        let (cacheAllTime, cacheDaily, lastComputed, cacheAvailable) = readCache(from: statsURL, counting: .all)
         let today = startOfDay(referenceDate)
 
         // Days on/before this are authoritative in the cache; days after it need JSONL.
@@ -149,12 +165,12 @@ struct TokenStatsService {
             scanFrom = max(dayAfter(cacheCutoff), windowStart)
         }
 
-        let (deltaDaily, anyJSONLParsed) = scanJSONL(
-            projectsDir: projectsDir,
-            cacheCutoff: cacheCutoff,
-            scanFrom: scanFrom,
-            today: today
-        )
+        // A cutoff on or after today makes `dayAfter(cutoff) > today`, which would trap when
+        // constructing the range. That happens routinely — the CLI advances lastComputedDate to
+        // today whenever it recomputes — and means the cache already covers everything.
+        let (deltaDaily, anyJSONLParsed): ([String: Int], Bool) = scanFrom <= today
+            ? scanJSONL(projectsDir: projectsDir, range: scanFrom...today, counting: .all)
+            : ([:], false)
 
         var allTime = 0
         var last7Days = 0
@@ -179,7 +195,10 @@ struct TokenStatsService {
 
     // MARK: - Cache reading
 
-    private func readCache(from url: URL) -> (allTime: Int, daily: [String: Int], lastComputed: Date?, available: Bool) {
+    private func readCache(
+        from url: URL,
+        counting kind: TokenKind
+    ) -> (allTime: Int, daily: [String: Int], lastComputed: Date?, available: Bool) {
         guard let data = try? Data(contentsOf: url),
               let cache = try? JSONDecoder().decode(Cache.self, from: data) else {
             return (0, [:], nil, false)
@@ -197,8 +216,10 @@ struct TokenStatsService {
             return (0, [:], nil, false)
         }
 
-        let allTime = (cache.modelUsage ?? [:]).values.reduce(0) { $0 + $1.total }
+        let allTime = (cache.modelUsage ?? [:]).values.reduce(0) { $0 + $1.amount(counting: kind) }
 
+        // Always cache-inclusive: the CLI pre-sums dailyModelTokens and the split is not
+        // recoverable from it. The cache-exclusive path therefore never reads this.
         var daily: [String: Int] = [:]
         for entry in cache.dailyModelTokens ?? [] {
             daily[entry.date, default: 0] += entry.tokensByModel.values.reduce(0, +)
@@ -278,17 +299,22 @@ struct TokenStatsService {
 
     // MARK: - JSONL scanning
 
-    /// Walks `projectsDir` for `*.jsonl` files and sums all four token kinds per day, restricted
-    /// to days strictly after `cacheCutoff`, within `[scanFrom, today]`.
+    /// Walks `projectsDir` for `*.jsonl` files and sums `kind`'s token kinds per day, restricted
+    /// to days within `range`.
     ///
-    /// Perf: files whose content-modification date predates `scanFrom` are skipped without being
-    /// opened. A JSONL file only gains lines for a given day when the CLI writes them that day,
-    /// so if its mtime is older than `scanFrom` it cannot contain any line we need.
+    /// The cache cutoff is not a parameter: the caller folds it into `range.lowerBound`. Days at
+    /// or before the cutoff are already inside `dailyModelTokens`, so the cache-inclusive caller
+    /// starts the range the day after it, while the cache-exclusive caller — which cannot use
+    /// `dailyModelTokens` at all — starts at the window's first day.
+    ///
+    /// Perf: files whose content-modification date predates `range.lowerBound` are skipped
+    /// without being opened. A JSONL file only gains lines for a given day when the CLI writes
+    /// them that day, so if its mtime is older than `range.lowerBound` it cannot contain any
+    /// line we need.
     private func scanJSONL(
         projectsDir: URL,
-        cacheCutoff: Date,
-        scanFrom: Date,
-        today: Date
+        range: ClosedRange<Date>,
+        counting kind: TokenKind
     ) -> (daily: [String: Int], anyParsed: Bool) {
         var daily: [String: Int] = [:]
         var anyParsed = false
@@ -305,9 +331,8 @@ struct TokenStatsService {
         // chronological order, so string comparison replaces per-line Date parsing entirely.
         // The old path parsed the prefix into a Date only for `dayKey` to format it straight
         // back into the identical string, through two DateFormatter calls per line.
-        let cutoffKey = cacheCutoff == .distantPast ? "" : dayKey(cacheCutoff)
-        let fromKey = dayKey(scanFrom)
-        let toKey = dayKey(today)
+        let fromKey = dayKey(range.lowerBound)
+        let toKey = dayKey(range.upperBound)
 
         let lineDecoder = JSONDecoder()
 
@@ -318,7 +343,7 @@ struct TokenStatsService {
             // writes); an externally-reset mtime could under-scan.
             if let values = try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]),
                let mtime = values.contentModificationDate,
-               mtime < scanFrom {
+               mtime < range.lowerBound {
                 continue
             }
 
@@ -356,8 +381,8 @@ struct TokenStatsService {
                                let timestamp = line.timestamp,
                                timestamp.count >= 10 {
                                 let day = String(timestamp.prefix(10))
-                                if Self.isValidDayKey(day), day > cutoffKey, day >= fromKey, day <= toKey {
-                                    daily[day, default: 0] += usage.total
+                                if Self.isValidDayKey(day), day >= fromKey, day <= toKey {
+                                    daily[day, default: 0] += usage.amount(counting: kind)
                                 }
                             }
                         }
