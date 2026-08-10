@@ -135,10 +135,13 @@ struct TokenStatsService {
     ///   - enabledFrames: Menu-bar metrics currently enabled. Non-token metrics are ignored.
     ///     Frames not present here are left at 0 - this is the load-reduction that keeps the
     ///     JSONL scan bounded to only what's actually displayed.
+    ///   - countCacheTokens: `true` reports what `claude` reports (input + output + cache read +
+    ///     cache creation). `false` counts only input + output.
     /// - Returns: `.unavailable` when neither the cache nor any JSONL file could be read, or
     ///   when no token frame is enabled.
     func load(
         enabledFrames: Set<MenuBarMetricType>,
+        countCacheTokens: Bool = true,
         statsURL: URL = Constants.ClaudePaths.statsCacheFile,
         projectsDir: URL = Constants.ClaudePaths.projectsDirectory,
         referenceDate: Date = Date()
@@ -146,8 +149,21 @@ struct TokenStatsService {
         let tokenFrames = enabledFrames.filter { $0.isTokenMetric }
         guard !tokenFrames.isEmpty else { return .unavailable }
 
-        let (cacheAllTime, cacheDaily, lastComputed, cacheAvailable) = readCache(from: statsURL, counting: .all)
         let today = startOfDay(referenceDate)
+        return countCacheTokens
+            ? loadCacheInclusive(tokenFrames: tokenFrames, statsURL: statsURL, projectsDir: projectsDir, today: today)
+            : loadCacheExclusive(tokenFrames: tokenFrames, statsURL: statsURL, projectsDir: projectsDir, today: today)
+    }
+
+    /// Windows come from the CLI's pre-summed `dailyModelTokens`, with JSONL supplying only the
+    /// days after `lastComputedDate` that the cache has not folded in yet.
+    private func loadCacheInclusive(
+        tokenFrames: Set<MenuBarMetricType>,
+        statsURL: URL,
+        projectsDir: URL,
+        today: Date
+    ) -> TokenStats {
+        let (cacheAllTime, cacheDaily, lastComputed, cacheAvailable) = readCache(from: statsURL, counting: .all)
 
         // Days on/before this are authoritative in the cache; days after it need JSONL.
         // With no usable cache, .distantPast means "nothing is covered - everything from JSONL".
@@ -186,6 +202,58 @@ struct TokenStatsService {
         }
         if tokenFrames.contains(.tokens30Days) {
             last30Days = windowSum(days: 30, today: today, cacheCutoff: cacheCutoff, cacheDaily: cacheDaily, deltaDaily: deltaDaily)
+        }
+
+        guard cacheAvailable || anyJSONLParsed else { return .unavailable }
+
+        return TokenStats(allTime: allTime, last7Days: last7Days, last30Days: last30Days, isAvailable: true)
+    }
+
+    /// Windows come entirely from JSONL: `dailyModelTokens` bakes cache tokens in and the split
+    /// is not recoverable, so the cutoff plays no part in the window arithmetic here. All-time
+    /// still starts from `modelUsage`, whose input/output fields kept their pre-2.1.221 meaning.
+    private func loadCacheExclusive(
+        tokenFrames: Set<MenuBarMetricType>,
+        statsURL: URL,
+        projectsDir: URL,
+        today: Date
+    ) -> TokenStats {
+        let (cacheIOAllTime, _, lastComputed, cacheAvailable) = readCache(from: statsURL, counting: .inputOutputOnly)
+        let cacheCutoff = lastComputed ?? .distantPast
+
+        // All-time needs the days the cache has not folded in yet; windows need their whole span.
+        // The scan starts at whichever is earlier, so one pass serves every enabled frame.
+        var scanFrom: Date?
+        if tokenFrames.contains(.tokensAllTime) {
+            scanFrom = dayAfter(cacheCutoff)
+        }
+        let maxWindow = tokenFrames.contains(.tokens30Days) ? 30 : (tokenFrames.contains(.tokens7Days) ? 7 : 0)
+        if maxWindow > 0 {
+            let windowStart = Self.calendar.date(byAdding: .day, value: -(maxWindow - 1), to: today) ?? today
+            scanFrom = scanFrom.map { min($0, windowStart) } ?? windowStart
+        }
+
+        let (daily, anyJSONLParsed): ([String: Int], Bool) = {
+            guard let from = scanFrom, from <= today else { return ([:], false) }
+            return scanJSONL(projectsDir: projectsDir, range: from...today, counting: .inputOutputOnly)
+        }()
+
+        var allTime = 0
+        var last7Days = 0
+        var last30Days = 0
+
+        if tokenFrames.contains(.tokensAllTime) {
+            // `daily` may reach back before the cutoff to serve a window, so all-time takes only
+            // the days the cache has not already counted.
+            let cutoffKey = cacheCutoff == .distantPast ? "" : dayKey(cacheCutoff)
+            let afterCutoff = daily.reduce(0) { $1.key > cutoffKey ? $0 + $1.value : $0 }
+            allTime = cacheIOAllTime + afterCutoff
+        }
+        if tokenFrames.contains(.tokens7Days) {
+            last7Days = jsonlWindowSum(days: 7, today: today, daily: daily)
+        }
+        if tokenFrames.contains(.tokens30Days) {
+            last30Days = jsonlWindowSum(days: 30, today: today, daily: daily)
         }
 
         guard cacheAvailable || anyJSONLParsed else { return .unavailable }
@@ -412,6 +480,19 @@ struct TokenStatsService {
             guard let day = Self.calendar.date(byAdding: .day, value: -offset, to: today) else { continue }
             let key = dayKey(day)
             total += day <= cacheCutoff ? (cacheDaily[key] ?? 0) : (deltaDaily[key] ?? 0)
+        }
+        return total
+    }
+
+    /// Sums the trailing `days`-day window ending at `today` from JSONL data alone.
+    ///
+    /// Unlike `windowSum` there is no cutoff branch: in cache-exclusive mode every day in the
+    /// window comes from `daily`, including days the CLI has already folded into its cache.
+    private func jsonlWindowSum(days: Int, today: Date, daily: [String: Int]) -> Int {
+        var total = 0
+        for offset in 0..<days {
+            guard let day = Self.calendar.date(byAdding: .day, value: -offset, to: today) else { continue }
+            total += daily[dayKey(day)] ?? 0
         }
         return total
     }
