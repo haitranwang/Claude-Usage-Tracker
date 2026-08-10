@@ -10,7 +10,13 @@ private final class StubInput: TokenStatsInputProviding {
 }
 
 /// The loader closure runs on a background queue, so counters it touches need their own lock.
-private final class Counter {
+///
+/// `@unchecked Sendable`: every stored property is private and every access - read or write -
+/// goes through `lock`, so it is genuinely safe to share across the isolation domains this test
+/// file hands it to (the coordinator's background queue, its `@MainActor` delivery, and the test
+/// method itself). The compiler cannot verify that on its own for a plain reference type with
+/// mutable state, which is exactly what this annotation is for.
+private final class Counter: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
 
@@ -303,13 +309,22 @@ final class TokenStatsRefreshCoordinatorTests: XCTestCase {
         let input = StubInput()
         let delegate = RecordingDelegate()
 
-        // Two start() calls contribute exactly two immediate scans (one per call), plus exactly
-        // one tick once the interval elapses if start() correctly leaves only one timer running.
-        // Rather than sampling the counter at one arbitrary point in time - which either requires
-        // the tick to land inside an unrealistically tight window (flaky on a loaded machine) or
-        // lets a second timer's coalesced tick land *after* the sample and pass anyway - use an
-        // expectation with a hard fulfillment ceiling: a fourth load (from a second, un-invalidated
-        // timer) over-fulfills and fails the test immediately, whenever it happens to occur.
+        // The two start() calls do NOT contribute two immediate scans of their own: `queue.async`
+        // can never run inline on the calling thread, so by the time the second start()'s
+        // internal refreshNow() runs (synchronously, right after the first), the first call's
+        // scan has not yet had a chance to finish - isLoading is still true, so the second call's
+        // refresh always coalesces via pendingRefresh rather than launching a second scan
+        // alongside it. What actually happens, deterministically, is: one immediate scan from the
+        // first start() (which the second start()'s stop() then makes stale by bumping the
+        // generation), one follow-up scan once that stale scan finishes (consuming the coalesced
+        // pendingRefresh, now under the fresh generation), and - if start() correctly leaves only
+        // one timer running - exactly one tick once the interval elapses. Three loads total.
+        //
+        // Rather than asserting that exact sequence directly, use an expectation with a hard
+        // fulfillment ceiling: a fourth load (which only a second, un-invalidated timer ticking
+        // in parallel could produce) over-fulfills and fails the test immediately, whenever it
+        // happens to occur. This is what actually distinguishes "one timer" from "two timers" -
+        // the count of loads contributed by the two start() calls themselves is 2 either way.
         let loadCount = expectation(description: "two immediate scans plus one tick from a single timer")
         loadCount.expectedFulfillmentCount = 3
         loadCount.assertForOverFulfill = true
@@ -340,6 +355,64 @@ final class TokenStatsRefreshCoordinatorTests: XCTestCase {
     func testStopBeforeStartDoesNotCrash() {
         let coordinator = TokenStatsRefreshCoordinator(interval: 300) { _, _ in .unavailable }
         coordinator.stop()
+    }
+
+    @MainActor
+    func testStartWhileScanInFlightStillProducesFreshDelivery() {
+        // Defect 1 regression: start() calls stop() internally, which bumps the generation and
+        // clears pendingRefresh. If a scan is already in flight when start() runs, its own
+        // primed refreshNow() call finds isLoading still true and coalesces via pendingRefresh
+        // rather than dropping straight through - so that pending flag must survive the stop()
+        // that already ran, and the in-flight scan's completion must turn it into a genuinely
+        // fresh follow-up scan (reading input fresh, under the new generation), not silently do
+        // nothing until the next timer tick. Before the fix, the `!isStale &&` gate in
+        // finishScan discarded this pending flag along with the stale scan, and the coordinator
+        // would sit idle with no data until the next tick.
+        let scanAStarted = expectation(description: "scan A started")
+        let release = DispatchSemaphore(value: 0)
+        let delivered = expectation(description: "the fresh scan start() primed was delivered")
+        let delegate = RecordingDelegate(expectation: delivered)
+        let counter = Counter()
+        let input = StubInput()
+
+        let coordinator = TokenStatsRefreshCoordinator(interval: 300) { _, _ in
+            let callNumber = counter.incrementAndGet()
+            if callNumber == 1 {
+                scanAStarted.fulfill()
+                release.wait()
+                // Scan A's own result; it must never reach the delegate; it belongs to the
+                // generation stop() (via start()) already invalidated.
+                return TokenStats(allTime: 1, last7Days: 1, last30Days: 1, isAvailable: true)
+            }
+            return TokenStats(allTime: 2, last7Days: 2, last30Days: 2, isAvailable: true)
+        }
+        coordinator.input = input
+        coordinator.delegate = delegate
+
+        withExtendedLifetime((input, delegate, coordinator)) {
+            coordinator.refreshNow() // scan A begins, parks in the loader
+            wait(for: [scanAStarted], timeout: 5)
+
+            // start() calls stop() (bumping the generation and clearing pendingRefresh) and then
+            // primes a refresh of its own - which coalesces, since scan A is still in flight.
+            coordinator.start()
+
+            release.signal() // let scan A finish; its result is now stale
+
+            wait(for: [delivered], timeout: 5)
+
+            XCTAssertEqual(
+                counter.value, 2,
+                "start() while a scan is in flight must trigger exactly one fresh follow-up scan"
+            )
+            XCTAssertEqual(delegate.received.count, 1, "only the fresh scan's result may reach the delegate")
+            XCTAssertEqual(
+                delegate.received.first?.allTime, 2,
+                "the delivered result must be the fresh scan's, not the stale one from before start()"
+            )
+
+            coordinator.stop()
+        }
     }
 
     // MARK: - stop() fencing
@@ -424,6 +497,60 @@ final class TokenStatsRefreshCoordinatorTests: XCTestCase {
             XCTAssertTrue(
                 delegate.received.isEmpty,
                 "a result from a scan that started before stop() must be discarded, not delivered"
+            )
+        }
+    }
+
+    @MainActor
+    func testStopRacingScanCompletionSuppressesDelivery() {
+        // Defect 3 regression: the previous fix latched staleness on the background queue, right
+        // as the scan finished, before hopping to the main actor to deliver. A stop() that runs
+        // after that latch but before the delivery continuation executes still saw the pre-stop()
+        // "not stale" verdict and delivered anyway - and could still authorise a follow-up scan.
+        // The fix moves the whole decision (staleness, delivery, follow-up) into a single locked
+        // section inside the main-actor continuation, so it is ordered after any stop() that has
+        // already run by the time that continuation gets to execute - not after whatever the
+        // background queue happened to observe first.
+        //
+        // The loader signals a semaphore on its way out (its work is done; it is about to return
+        // control to the coordinator's background block), and this test blocks the main actor on
+        // that semaphore. The signalling background thread runs on into the coordinator's
+        // completion handling with no context switch of its own, while the waiting main thread
+        // must first be woken by the scheduler - so by the time this test's stop() call runs, the
+        // background side has, in practice, already finished its part of the race. Blocking the
+        // main actor for the duration additionally guarantees the delivery continuation itself
+        // cannot execute until after stop() returns, regardless of how that race lands, which is
+        // what makes the assertions below hold deterministically post-fix.
+        let loaderAboutToReturn = DispatchSemaphore(value: 0)
+        let input = StubInput()
+        let delegate = RecordingDelegate()
+        let noDelivery = expectation(description: "no delivery of a result racing stop() on its way out")
+        noDelivery.isInverted = true
+        delegate.expectation = noDelivery
+        let counter = Counter()
+
+        let coordinator = makeCoordinator(input: input, delegate: delegate) { _, _ in
+            counter.increment()
+            let stats = TokenStats(allTime: 5, last7Days: 5, last30Days: 5, isAvailable: true)
+            loaderAboutToReturn.signal()
+            return stats
+        }
+
+        withExtendedLifetime((input, delegate, coordinator)) {
+            coordinator.refreshNow()
+            loaderAboutToReturn.wait()
+
+            coordinator.stop()
+
+            wait(for: [noDelivery], timeout: 1)
+
+            XCTAssertEqual(
+                counter.value, 1,
+                "stop() must not authorise a follow-up scan for a result it raced"
+            )
+            XCTAssertTrue(
+                delegate.received.isEmpty,
+                "a result racing stop() on its way out must still be discarded, not delivered"
             )
         }
     }
