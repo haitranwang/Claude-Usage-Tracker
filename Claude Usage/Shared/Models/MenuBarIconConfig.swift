@@ -425,6 +425,9 @@ struct MenuBarIconConfiguration: Codable, Equatable {
     var showTimeMarker: Bool
     var showPaceMarker: Bool
     var usePaceColoring: Bool
+    /// When true, the Total Tokens metrics report what `claude` reports: input + output +
+    /// cache read + cache creation. When false, only input + output.
+    var countCacheTokens: Bool
     var metrics: [MetricIconConfig]
 
     init(
@@ -435,6 +438,7 @@ struct MenuBarIconConfiguration: Codable, Equatable {
         showTimeMarker: Bool = true,
         showPaceMarker: Bool = true,
         usePaceColoring: Bool = true,
+        countCacheTokens: Bool = true,
         metrics: [MetricIconConfig] = [
             .sessionDefault,
             .weekDefault,
@@ -451,6 +455,7 @@ struct MenuBarIconConfiguration: Codable, Equatable {
         self.showTimeMarker = showTimeMarker
         self.showPaceMarker = showPaceMarker
         self.usePaceColoring = usePaceColoring
+        self.countCacheTokens = countCacheTokens
         self.metrics = metrics
     }
 
@@ -465,6 +470,7 @@ struct MenuBarIconConfiguration: Codable, Equatable {
         case showTimeMarker
         case showPaceMarker
         case usePaceColoring
+        case countCacheTokens
         case metrics
     }
 
@@ -484,6 +490,9 @@ struct MenuBarIconConfiguration: Codable, Equatable {
         showTimeMarker = try container.decodeIfPresent(Bool.self, forKey: .showTimeMarker) ?? true
         showPaceMarker = try container.decodeIfPresent(Bool.self, forKey: .showPaceMarker) ?? false
         usePaceColoring = try container.decodeIfPresent(Bool.self, forKey: .usePaceColoring) ?? false
+        // Absent for every profile saved before this feature; default true keeps existing
+        // numbers identical on upgrade.
+        countCacheTokens = try container.decodeIfPresent(Bool.self, forKey: .countCacheTokens) ?? true
         metrics = try container.decode([MetricIconConfig].self, forKey: .metrics)
         // Backfill token metrics for configs saved before this feature existed.
         let tokenDefaults: [MetricIconConfig] = [.tokensAllTimeDefault, .tokens7DaysDefault, .tokens30DaysDefault]
@@ -501,6 +510,7 @@ struct MenuBarIconConfiguration: Codable, Equatable {
         try container.encode(showTimeMarker, forKey: .showTimeMarker)
         try container.encode(showPaceMarker, forKey: .showPaceMarker)
         try container.encode(usePaceColoring, forKey: .usePaceColoring)
+        try container.encode(countCacheTokens, forKey: .countCacheTokens)
         try container.encode(metrics, forKey: .metrics)
         // Note: We don't encode monochromeMode anymore - it's only for reading legacy data
     }
