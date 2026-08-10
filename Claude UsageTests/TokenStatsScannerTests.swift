@@ -137,7 +137,7 @@ final class TokenStatsScannerTests: XCTestCase {
 
         var bytes = Data(line(day(offsetFromToday: -1), input: 10, output: 5).utf8)
         bytes.append(UInt8(ascii: "\n"))
-        bytes.append(0xFF) // lone continuation byte: invalid UTF-8 on its own
+        bytes.append(0xFF) // 0xFF is not valid UTF-8 at any position (not a continuation byte, which is 0x80-0xBF)
         bytes.append(UInt8(ascii: "\n"))
         bytes.append(Data(line(day(offsetFromToday: -1), input: 1, output: 2).utf8))
 
@@ -146,5 +146,32 @@ final class TokenStatsScannerTests: XCTestCase {
         try! bytes.write(to: fileURL)
 
         XCTAssertEqual(allTime(projectsDir.deletingLastPathComponent()), 18)
+    }
+
+    func testFileWithNoDecodableLineStillReportsAvailable() {
+        // Under the old strict-UTF-8 `String(contentsOf:encoding:.utf8)` read, a file that
+        // failed to decode was skipped entirely before `anyParsed` was set, so - with no
+        // stats-cache.json present - `load` fell through to `.unavailable` and the menu-bar
+        // metric hid itself rather than showing 0. The memory-mapped read has no such
+        // all-or-nothing failure mode: the file opens successfully regardless of its bytes, so
+        // `anyParsed` is set even when it contains no decodable line at all. Availability must
+        // reflect that: the metric should show 0, not disappear.
+        let projectsDir = tempDir.appendingPathComponent("projects/p")
+        try! FileManager.default.createDirectory(at: projectsDir, withIntermediateDirectories: true)
+
+        let bytes = Data(repeating: 0xFF, count: 32)
+        let fileURL = projectsDir.appendingPathComponent("session.jsonl")
+        FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+        try! bytes.write(to: fileURL)
+
+        let stats = TokenStatsService().load(
+            enabledFrames: [.tokensAllTime],
+            statsURL: tempDir.appendingPathComponent("no-such-cache.json"),
+            projectsDir: projectsDir.deletingLastPathComponent(),
+            referenceDate: referenceDate
+        )
+
+        XCTAssertTrue(stats.isAvailable)
+        XCTAssertEqual(stats.allTime, 0)
     }
 }

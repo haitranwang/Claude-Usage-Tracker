@@ -242,23 +242,37 @@ struct TokenStatsService {
     /// as strings against calendar-day bounds. Without this check, an impossible date like
     /// `"2026-07-32"` satisfies those string comparisons (it sorts between real dates) and its
     /// tokens land under a key that `windowSum` can never enumerate - invisible to 7D/30D but
-    /// still summed into all-time, breaking `allTime >= last30Days >= last7Days`. This runs per
+    /// still summed into all-time. This narrows that problem rather than eliminating it: it is
+    /// a shape check, not full calendar validation, so a shaped-but-impossible date whose month
+    /// and day both fall within `01-31` (`2026-02-30`, `2026-04-31`, `2026-02-29` in a non-leap
+    /// year, and similar) still passes and can still inflate all-time the same way. That gap is
+    /// deliberately left open: CLI-emitted ISO-8601 timestamps never produce those shapes, and
+    /// full calendar validation is out of scope for a per-line hot-path check. This runs per
     /// line, so it's a character-by-character shape check rather than a `DateFormatter`
     /// round trip.
     private static func isValidDayKey(_ key: some StringProtocol) -> Bool {
         guard key.count == 10 else { return false }
-        var digits: [Int] = []
-        digits.reserveCapacity(8)
+        // No per-line allocation: digits are folded into four locals as they're walked, rather
+        // than collected into an array, since this runs on every usage-bearing line of every
+        // scanned file (~100k times on a 20 MB session file).
+        var monthTens = 0, monthOnes = 0, dayTens = 0, dayOnes = 0
         for (index, char) in key.enumerated() {
             if index == 4 || index == 7 {
                 guard char == "-" else { return false }
-            } else {
-                guard let ascii = char.asciiValue, ascii >= 48, ascii <= 57 else { return false }
-                digits.append(Int(ascii - 48))
+                continue
+            }
+            guard let ascii = char.asciiValue, ascii >= 48, ascii <= 57 else { return false }
+            let digit = Int(ascii - 48)
+            switch index {
+            case 5: monthTens = digit
+            case 6: monthOnes = digit
+            case 8: dayTens = digit
+            case 9: dayOnes = digit
+            default: break
             }
         }
-        let month = digits[4] * 10 + digits[5]
-        let day = digits[6] * 10 + digits[7]
+        let month = monthTens * 10 + monthOnes
+        let day = dayTens * 10 + dayOnes
         return (1...12).contains(month) && (1...31).contains(day)
     }
 
