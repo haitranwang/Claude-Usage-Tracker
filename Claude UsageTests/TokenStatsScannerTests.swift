@@ -103,10 +103,48 @@ final class TokenStatsScannerTests: XCTestCase {
 
     func testUnparseableTimestampIsRejected() {
         // Day keys are compared as strings; garbage must not slip past the range check.
+        //
+        // Note: "not-a-real-timestamp" is rejected here only because ASCII 'n' sorts above the
+        // digits in `toKey`, failing the upper-bound string comparison - not because the shape
+        // check recognises it as a non-date. `testMalformedCalendarDayIsRejected` below covers
+        // the shape check itself with an input the range compare alone would accept.
         let bad = """
         {"type":"assistant","timestamp":"not-a-real-timestamp","message":{"usage":{"input_tokens":999,"output_tokens":999}}}
         """
         let dir = writeRawJSONL(bad + "\n" + line(day(offsetFromToday: -1), input: 4, output: 1))
         XCTAssertEqual(allTime(dir), 5)
+    }
+
+    func testMalformedCalendarDayIsRejected() {
+        // "2026-07-32" has no real calendar meaning, but its digits and dashes are shaped just
+        // like a real day key, and it sorts within range of any window that spans July/August -
+        // so without a shape+range check on month/day, its tokens would land under a key
+        // `windowSum` can never enumerate (invisible to 7D/30D) while still inflating all-time.
+        let bad = """
+        {"type":"assistant","timestamp":"2026-07-32T12:00:00.000Z","message":{"usage":{"input_tokens":999,"output_tokens":999}}}
+        """
+        let dir = writeRawJSONL(bad + "\n" + line(day(offsetFromToday: -1), input: 4, output: 1))
+        XCTAssertEqual(allTime(dir), 5)
+    }
+
+    func testInvalidUTF8ByteDoesNotDropTheWholeFile() {
+        // Unlike the old strict-UTF-8 `String(contentsOf:encoding:.utf8)` read - which returned
+        // nil, and dropped the entire file, if a single byte anywhere was invalid UTF-8 - the
+        // memory-mapped `Data` read has no such validation. A file with one corrupted line must
+        // still contribute its other, decodable lines.
+        let projectsDir = tempDir.appendingPathComponent("projects/p")
+        try! FileManager.default.createDirectory(at: projectsDir, withIntermediateDirectories: true)
+
+        var bytes = Data(line(day(offsetFromToday: -1), input: 10, output: 5).utf8)
+        bytes.append(UInt8(ascii: "\n"))
+        bytes.append(0xFF) // lone continuation byte: invalid UTF-8 on its own
+        bytes.append(UInt8(ascii: "\n"))
+        bytes.append(Data(line(day(offsetFromToday: -1), input: 1, output: 2).utf8))
+
+        let fileURL = projectsDir.appendingPathComponent("session.jsonl")
+        FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+        try! bytes.write(to: fileURL)
+
+        XCTAssertEqual(allTime(projectsDir.deletingLastPathComponent()), 18)
     }
 }

@@ -235,6 +235,33 @@ struct TokenStatsService {
         return false
     }
 
+    /// Validates that `key` has the shape `DDDD-DD-DD` - digits in every digit position, `-` at
+    /// indexes 4 and 7 - with a month in 01-12 and a day in 01-31.
+    ///
+    /// Day keys are the raw first 10 characters of a JSONL line's `timestamp` field, compared
+    /// as strings against calendar-day bounds. Without this check, an impossible date like
+    /// `"2026-07-32"` satisfies those string comparisons (it sorts between real dates) and its
+    /// tokens land under a key that `windowSum` can never enumerate - invisible to 7D/30D but
+    /// still summed into all-time, breaking `allTime >= last30Days >= last7Days`. This runs per
+    /// line, so it's a character-by-character shape check rather than a `DateFormatter`
+    /// round trip.
+    private static func isValidDayKey(_ key: some StringProtocol) -> Bool {
+        guard key.count == 10 else { return false }
+        var digits: [Int] = []
+        digits.reserveCapacity(8)
+        for (index, char) in key.enumerated() {
+            if index == 4 || index == 7 {
+                guard char == "-" else { return false }
+            } else {
+                guard let ascii = char.asciiValue, ascii >= 48, ascii <= 57 else { return false }
+                digits.append(Int(ascii - 48))
+            }
+        }
+        let month = digits[4] * 10 + digits[5]
+        let day = digits[6] * 10 + digits[7]
+        return (1...12).contains(month) && (1...31).contains(day)
+    }
+
     // MARK: - JSONL scanning
 
     /// Walks `projectsDir` for `*.jsonl` files and sums all four token kinds per day, restricted
@@ -284,11 +311,19 @@ struct TokenStatsService {
             // Memory-mapped: these files reach ~20 MB and the old path materialised each one as
             // a String plus an array of Substrings. Claude Code only ever appends to them or
             // unlinks them wholesale, so the mapping cannot be truncated under us.
+            //
+            // Behavior change from the old `String(contentsOf:encoding:.utf8)` read: that
+            // initializer is strict UTF-8, so a single invalid byte anywhere in the file made
+            // the whole read return `nil` and the file was skipped entirely, before
+            // `anyParsed` was ever set. `Data(contentsOf:options:.mappedIfSafe)` has no such
+            // validation and succeeds on arbitrary bytes, so a file with e.g. one line
+            // truncated mid multi-byte character by a crash now sets `anyParsed = true` and
+            // contributes every other, decodable line instead of being dropped whole. This is
+            // deliberate: one corrupt byte should not erase every token statistic for a file.
             guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else { continue }
             anyParsed = true
 
             data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
-                guard let base = buffer.baseAddress else { return }
                 let count = buffer.count
                 var lineStart = 0
                 var i = 0
@@ -297,13 +332,17 @@ struct TokenStatsService {
                 while i <= count {
                     if i == count || buffer[i] == UInt8(ascii: "\n") {
                         if i > lineStart, Self.containsUsageKey(buffer, from: lineStart, to: i) {
-                            let lineData = Data(bytes: base.advanced(by: lineStart), count: i - lineStart)
+                            // No-copy slice over the mapped storage - `Data(bytes:count:)` would
+                            // allocate and copy every candidate line. `JSONDecoder` accepts a
+                            // slice directly; note it keeps `data`'s non-zero start index, so
+                            // don't assume the slice is zero-based elsewhere.
+                            let lineData = data[lineStart..<i]
                             if let line = try? lineDecoder.decode(Line.self, from: lineData),
                                let usage = line.message?.usage,
                                let timestamp = line.timestamp,
                                timestamp.count >= 10 {
                                 let day = String(timestamp.prefix(10))
-                                if day > cutoffKey, day >= fromKey, day <= toKey {
+                                if Self.isValidDayKey(day), day > cutoffKey, day >= fromKey, day <= toKey {
                                     daily[day, default: 0] += usage.total
                                 }
                             }
