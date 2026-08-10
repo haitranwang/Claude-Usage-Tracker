@@ -186,8 +186,63 @@ final class TokenStatsExclusiveModeTests: XCTestCase {
 
         XCTAssertEqual(stats.last7Days, 50, "37 + 13 within 7 days")
         XCTAssertEqual(stats.last30Days, 170, "120 + 37 + 13 within 30 days")
+        XCTAssertEqual(
+            stats.allTime, 6013,
+            """
+            6000 modelUsage io + 13 from the one post-cutoff JSONL day (day -1). The pre-cutoff \
+            day (-20, 120 io) and the on-cutoff-adjacent day (-3, 37 io) must NOT be added again: \
+            modelUsage already contains them, so double-counting would put allTime at 6170.
+            """
+        )
         XCTAssertGreaterThanOrEqual(stats.last30Days, stats.last7Days)
         XCTAssertGreaterThanOrEqual(stats.allTime, stats.last7Days)
+    }
+
+    func testExclusiveOrderingHoldsWithSelfConsistentCache() {
+        // Finding 3: exclusive mode's allTime (from modelUsage) and its windows (from JSONL) come
+        // from two independent sources, so allTime >= last30Days >= last7Days only holds because
+        // a self-consistent cache's modelUsage lifetime total already covers every pre-cutoff day
+        // still on disk. Build exactly that here: modelUsage io (300) comfortably covers the
+        // pre-cutoff days present in the fixture (120 + 37 = 157), the way a cache the CLI itself
+        // wrote always would.
+        let cutoff = day(offsetFromToday: -2)
+        let statsURL = writeStatsCache("""
+        {
+          "modelUsage": { "m": { "inputTokens": 250, "outputTokens": 50,
+                                 "cacheReadInputTokens": 900000, "cacheCreationInputTokens": 4000 } },
+          "dailyModelTokens": [],
+          "lastComputedDate": "\(cutoff)"
+        }
+        """)
+        let dir = writeJSONL([
+            (day: day(offsetFromToday: -20), input: 100, output: 20, cacheRead: 5_000, cacheCreate: 50),
+            (day: day(offsetFromToday: -3), input: 30, output: 7, cacheRead: 5_000, cacheCreate: 50),
+            (day: day(offsetFromToday: -1), input: 11, output: 2, cacheRead: 5_000, cacheCreate: 50)
+        ])
+
+        let stats = load([.tokensAllTime, .tokens7Days, .tokens30Days], statsURL: statsURL, projectsDir: dir)
+
+        XCTAssertEqual(stats.last7Days, 50, "37 + 13 within 7 days")
+        XCTAssertEqual(stats.last30Days, 170, "120 + 37 + 13 within 30 days")
+        XCTAssertEqual(stats.allTime, 313, "300 modelUsage io + 13 from the one post-cutoff day")
+        XCTAssertGreaterThanOrEqual(stats.allTime, stats.last30Days)
+        XCTAssertGreaterThanOrEqual(stats.last30Days, stats.last7Days)
+    }
+
+    func testExclusiveWindowUnavailableWhenProjectsDirHasNoJSONL() {
+        // Finding 2: with only a window frame enabled, a valid stats cache cannot vouch for it -
+        // the window comes entirely from JSONL in exclusive mode. A fresh install or a projects
+        // directory pruned of session files must report unavailable rather than a confident 0.
+        let cutoff = day(offsetFromToday: -2)
+        let statsURL = writeStatsCache("""
+        { "modelUsage": {}, "dailyModelTokens": [], "lastComputedDate": "\(cutoff)" }
+        """)
+        let emptyProjectsDir = tempDir.appendingPathComponent("projects-empty")
+        try! FileManager.default.createDirectory(at: emptyProjectsDir, withIntermediateDirectories: true)
+
+        let stats = load([.tokens7Days], statsURL: statsURL, projectsDir: emptyProjectsDir)
+
+        XCTAssertFalse(stats.isAvailable, "no JSONL exists to back the 7D window, so the cache can't vouch for it")
     }
 
     func testInclusiveModeStillDefaultsOn() {

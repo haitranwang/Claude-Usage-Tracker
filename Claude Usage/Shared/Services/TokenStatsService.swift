@@ -212,13 +212,27 @@ struct TokenStatsService {
     /// Windows come entirely from JSONL: `dailyModelTokens` bakes cache tokens in and the split
     /// is not recoverable, so the cutoff plays no part in the window arithmetic here. All-time
     /// still starts from `modelUsage`, whose input/output fields kept their pre-2.1.221 meaning.
+    ///
+    /// This relies on an assumption `windowSum`'s cache-inclusive counterpart doesn't need: that
+    /// `modelUsage`'s lifetime input+output already covers every pre-cutoff day still present in
+    /// the JSONL logs on disk. A cache the CLI wrote is self-consistent this way - `modelUsage`
+    /// and `dailyModelTokens` are both derived from the same JSONL history - so `allTime` never
+    /// dips below a window built from days already folded into that lifetime total. A cache that
+    /// has drifted from what's actually on disk (hand-edited, restored from a backup, a partial
+    /// write) could violate that and let `allTime` undercount. We deliberately do not clamp
+    /// against that here: forcing `allTime` up to match a window would fabricate a number and
+    /// hide a corrupt cache rather than reveal it.
     private func loadCacheExclusive(
         tokenFrames: Set<MenuBarMetricType>,
         statsURL: URL,
         projectsDir: URL,
         today: Date
     ) -> TokenStats {
-        let (cacheIOAllTime, _, lastComputed, cacheAvailable) = readCache(from: statsURL, counting: .inputOutputOnly)
+        // `computingDaily: false` - unlike the inclusive path, this one never reads the day
+        // dictionary `readCache` can build, so skip building it (see `readCache`'s comment).
+        let (cacheIOAllTime, _, lastComputed, cacheAvailable) = readCache(
+            from: statsURL, counting: .inputOutputOnly, computingDaily: false
+        )
         let cacheCutoff = lastComputed ?? .distantPast
 
         // All-time needs the days the cache has not folded in yet; windows need their whole span.
@@ -256,7 +270,16 @@ struct TokenStatsService {
             last30Days = jsonlWindowSum(days: 30, today: today, daily: daily)
         }
 
-        guard cacheAvailable || anyJSONLParsed else { return .unavailable }
+        // Unlike the inclusive path, a readable cache here vouches only for all-time (it comes
+        // from `modelUsage`). The window frames come entirely from JSONL, so a cache that parsed
+        // fine says nothing about them - only `anyJSONLParsed` can. Without this split, a valid
+        // cache alongside an unreadable/empty projects directory would report a confident zero
+        // for an enabled window instead of `.unavailable`.
+        let allTimeEnabled = tokenFrames.contains(.tokensAllTime)
+        let windowFrameEnabled = maxWindow > 0
+        guard (allTimeEnabled && cacheAvailable) || (windowFrameEnabled && anyJSONLParsed) else {
+            return .unavailable
+        }
 
         return TokenStats(allTime: allTime, last7Days: last7Days, last30Days: last30Days, isAvailable: true)
     }
@@ -265,7 +288,8 @@ struct TokenStatsService {
 
     private func readCache(
         from url: URL,
-        counting kind: TokenKind
+        counting kind: TokenKind,
+        computingDaily: Bool = true
     ) -> (allTime: Int, daily: [String: Int], lastComputed: Date?, available: Bool) {
         guard let data = try? Data(contentsOf: url),
               let cache = try? JSONDecoder().decode(Cache.self, from: data) else {
@@ -286,11 +310,16 @@ struct TokenStatsService {
 
         let allTime = (cache.modelUsage ?? [:]).values.reduce(0) { $0 + $1.amount(counting: kind) }
 
-        // Always cache-inclusive: the CLI pre-sums dailyModelTokens and the split is not
-        // recoverable from it. The cache-exclusive path therefore never reads this.
+        // dailyModelTokens is always cache-inclusive (the CLI pre-sums it and the split is not
+        // recoverable from it), so the cache-exclusive path never reads the dictionary below -
+        // it passes `computingDaily: false` to skip building it, since walking every
+        // dailyModelTokens entry on every refresh is pure allocation for a caller that discards
+        // the result.
         var daily: [String: Int] = [:]
-        for entry in cache.dailyModelTokens ?? [] {
-            daily[entry.date, default: 0] += entry.tokensByModel.values.reduce(0, +)
+        if computingDaily {
+            for entry in cache.dailyModelTokens ?? [] {
+                daily[entry.date, default: 0] += entry.tokensByModel.values.reduce(0, +)
+            }
         }
 
         return (allTime, daily, lastComputed, true)
