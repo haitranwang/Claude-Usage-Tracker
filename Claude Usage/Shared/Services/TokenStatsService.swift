@@ -52,7 +52,11 @@ struct TokenStatsService {
     // MARK: - JSONL line decoding
 
     /// Minimal shape of one assistant line in a `~/.claude/projects/**/*.jsonl` session file.
-    /// Decoded with `.convertFromSnakeCase` so `input_tokens`/`output_tokens` map directly.
+    ///
+    /// Keys are spelled out rather than derived via `.convertFromSnakeCase`: that strategy
+    /// transforms every key of every decoded object, including the many this struct ignores
+    /// (`content`, `id`, `role`, `model`, `stop_reason`, ...). Profiling put it at 11% of scan
+    /// time for six fields' worth of benefit.
     private struct Line: Decodable {
         struct Message: Decodable {
             struct Usage: Decodable {
@@ -60,6 +64,13 @@ struct TokenStatsService {
                 let outputTokens: Int?
                 let cacheReadInputTokens: Int?
                 let cacheCreationInputTokens: Int?
+
+                enum CodingKeys: String, CodingKey {
+                    case inputTokens = "input_tokens"
+                    case outputTokens = "output_tokens"
+                    case cacheReadInputTokens = "cache_read_input_tokens"
+                    case cacheCreationInputTokens = "cache_creation_input_tokens"
+                }
 
                 var total: Int {
                     (inputTokens ?? 0) + (outputTokens ?? 0)
@@ -229,7 +240,6 @@ struct TokenStatsService {
         }
 
         let lineDecoder = JSONDecoder()
-        lineDecoder.keyDecodingStrategy = .convertFromSnakeCase
 
         for case let fileURL as URL in enumerator {
             guard fileURL.pathExtension == "jsonl" else { continue }
