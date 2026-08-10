@@ -17,7 +17,8 @@
 - **Day keys are `"yyyy-MM-dd"` strings bucketed by the UTC date prefix of the JSONL `timestamp` field.** Never convert to local time before bucketing — the CLI buckets by UTC, and converting first silently shifts tokens across day boundaries.
 - **Test command:** `xcodebuild test -project "Claude Usage.xcodeproj" -scheme "Claude Usage" -destination 'platform=macOS' -only-testing:"Claude UsageTests/<SuiteName>"`. Drop `-only-testing:` to run everything.
 - **All 14 locales get every new string key:** `de`, `en`, `es`, `fr`, `it`, `ja`, `ko`, `pt-BR`, `pt`, `tr`, `uk`, `vi`, `zh-Hant`, `zh-ch`. A missing key renders as the raw key — there is no fallback layer.
-- Commit after every task. Conventional-commit prefixes (`perf:`, `feat:`, `refactor:`, `test:`).
+- Commit after every task, and **every commit must build and pass the suite**. Conventional-commit prefixes (`perf:`, `feat:`, `refactor:`, `test:`).
+- **Execution order is 1, 2, 3, 4, 5, 7, 6, 8.** Task 7 is pulled ahead of Task 6 because Task 6 reads the property Task 7 adds; the numbering is left alone so file references stay stable.
 
 ---
 
@@ -1461,11 +1462,16 @@ git commit -m "feat(tokens): dedicated 300s refresh coordinator with overlap gua
 
 ## Task 6: Move `MenuBarManager` onto the coordinator
 
+> **Execution order:** this task runs **after Task 7**, not before it. Task 7 adds
+> `MenuBarIconConfiguration.countCacheTokens`, which this task reads; doing Task 6 first would
+> leave a commit that does not compile. Task 7 has no dependency on this task, so the swap costs
+> nothing and every commit stays buildable.
+
 **Files:**
 - Modify: `Claude Usage/MenuBar/MenuBarManager.swift:1445-1456` (remove inline load), plus lifecycle wiring
 
 **Interfaces:**
-- Consumes: `TokenStatsRefreshCoordinator`, `TokenStatsInputProviding`, `TokenStatsRefreshCoordinatorDelegate` from Task 5
+- Consumes: `TokenStatsRefreshCoordinator`, `TokenStatsInputProviding`, `TokenStatsRefreshCoordinatorDelegate` from Task 5; `MenuBarIconConfiguration.countCacheTokens` from Task 7
 - Produces: nothing new; `MenuBarManager.tokenStats` keeps its existing type and role.
 
 - [ ] **Step 1: Remove the inline load from the usage refresh**
@@ -1531,7 +1537,7 @@ extension MenuBarManager: TokenStatsRefreshCoordinatorDelegate {
 }
 ```
 
-`countCacheTokens` on the config does not exist until Task 7. Until then this will not compile — that is expected and is resolved in Task 7. **Do not attempt to build between Step 3 and Task 7 Step 3.**
+`MenuBarIconConfiguration.countCacheTokens` already exists at this point — Task 7 ran first. If it does not resolve, Task 7 was skipped; stop and complete it before continuing.
 
 - [ ] **Step 4: Start and stop the coordinator with the manager**
 
@@ -1557,9 +1563,16 @@ In the method that handles a user-triggered refresh (the one that sets `lastRefr
 
 In the profile-change handler that reloads configuration, add the same line. This is what makes a toggle flip or a card being enabled show up without waiting out the 300-second interval.
 
-- [ ] **Step 6: Defer building until Task 7**
+- [ ] **Step 6: Build and run the full suite**
 
-This task's changes reference `countCacheTokens`, added in Task 7. Commit the work now and build at Task 7 Step 3.
+```bash
+xcodebuild test -project "Claude Usage.xcodeproj" -scheme "Claude Usage" \
+  -destination 'platform=macOS' 2>&1 | grep -cE "Test case .* failed"
+```
+
+Expected output: `0`. There are no unit tests for `MenuBarManager` itself — this step's job is to prove the wiring compiles and nothing else regressed.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add "Claude Usage/MenuBar/MenuBarManager.swift"
@@ -1575,6 +1588,9 @@ cache-inclusive mode."
 # PHASE 3 — Toggle, UI, localization
 
 ## Task 7: `countCacheTokens` on `MenuBarIconConfiguration`
+
+> **Execution order:** this task runs **before Task 6**. Task 6 reads the property added here, so
+> doing it first keeps every commit buildable.
 
 **Files:**
 - Modify: `Claude Usage/Shared/Models/MenuBarIconConfig.swift:420-506`
@@ -1718,7 +1734,7 @@ xcodebuild test -project "Claude Usage.xcodeproj" -scheme "Claude Usage" \
   -destination 'platform=macOS' 2>&1 | grep -cE "Test case .* failed"
 ```
 
-Expected output: `0`. This is also the first build since Task 6 — `MenuBarManager`'s reference to `countCacheTokens` now resolves.
+Expected output: `0`.
 
 - [ ] **Step 5: Commit**
 
