@@ -136,6 +136,11 @@ enum Constants {
         static let widgetSmall: TimeInterval = 900   // 15 minutes
         static let widgetMedium: TimeInterval = 900  // 15 minutes
         static let widgetLarge: TimeInterval = 1800  // 30 minutes
+
+        /// Token stats are read from local JSONL, not the API, and a 30-day window walks hundreds
+        /// of megabytes. They get a slower cadence than the 30-second usage refresh - deliberately
+        /// more headroom than the scan currently needs, so the margin survives corpus growth.
+        static let tokenStats: TimeInterval = 300    // 5 minutes
     }
 
     // Session window (5 hours in seconds)
