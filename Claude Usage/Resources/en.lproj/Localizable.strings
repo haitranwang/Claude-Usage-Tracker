@@ -1026,3 +1026,6 @@
 /* Sponsor slot */
 "sponsor.slot_title" = "This spot is available for sponsors";
 "sponsor.slot_cta" = "Get in touch";
+
+"appearance.count_cache_tokens_title" = "Count cache tokens";
+"appearance.count_cache_tokens_description" = "Matches `claude` stats. Turn off to count only input + output tokens.";

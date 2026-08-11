@@ -1026,3 +1026,6 @@
 /* Sponsor slot */
 "sponsor.slot_title" = "Vị trí này dành cho nhà tài trợ";
 "sponsor.slot_cta" = "Liên hệ ngay";
+
+"appearance.count_cache_tokens_title" = "Tính cả token cache";
+"appearance.count_cache_tokens_description" = "Khớp với số liệu của `claude`. Tắt để chỉ tính token input + output.";

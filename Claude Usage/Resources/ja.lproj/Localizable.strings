@@ -1030,3 +1030,6 @@
 /* Sponsor slot */
 "sponsor.slot_title" = "スポンサー募集中のスペースです";
 "sponsor.slot_cta" = "お問い合わせ";
+
+"appearance.count_cache_tokens_title" = "Count cache tokens";
+"appearance.count_cache_tokens_description" = "Matches `claude` stats. Turn off to count only input + output tokens.";

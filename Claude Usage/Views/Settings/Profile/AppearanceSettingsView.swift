@@ -226,6 +226,21 @@ struct AppearanceSettingsView: View {
                                 onConfigChanged: { saveConfiguration() }
                             )
                         }
+
+                        Divider()
+                            .padding(.vertical, DesignTokens.Spacing.small)
+
+                        SettingToggle(
+                            title: "appearance.count_cache_tokens_title".localized,
+                            description: "appearance.count_cache_tokens_description".localized,
+                            isOn: Binding(
+                                get: { configuration.countCacheTokens },
+                                set: { newValue in
+                                    configuration.countCacheTokens = newValue
+                                    saveConfiguration()
+                                }
+                            )
+                        )
                     }
                 }
                 .disabled(isMultiProfileMode)

@@ -1016,3 +1016,6 @@
 /* Sponsor slot */
 "sponsor.slot_title" = "此位置開放贊助";
 "sponsor.slot_cta" = "與我聯繫";
+
+"appearance.count_cache_tokens_title" = "Count cache tokens";
+"appearance.count_cache_tokens_description" = "Matches `claude` stats. Turn off to count only input + output tokens.";

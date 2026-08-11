@@ -66,8 +66,10 @@ nonisolated enum MenuBarMetricType: String, Codable, CaseIterable, Identifiable 
             return "Weekly token usage (all models)"
         case .api:
             return "API Console billing credits"
+        // No claim about which token kinds are counted - that depends on the Count cache
+        // tokens toggle, and `description` has no access to profile config.
         case .tokensAllTime:
-            return "Claude Code lifetime tokens (input+output)"
+            return "Claude Code lifetime tokens"
         case .tokens7Days:
             return "Claude Code tokens, last 7 days"
         case .tokens30Days:

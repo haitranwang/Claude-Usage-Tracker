@@ -1025,3 +1025,6 @@
 /* Sponsor slot */
 "sponsor.slot_title" = "Це місце доступне для спонсорів";
 "sponsor.slot_cta" = "Звʼязатися";
+
+"appearance.count_cache_tokens_title" = "Count cache tokens";
+"appearance.count_cache_tokens_description" = "Matches `claude` stats. Turn off to count only input + output tokens.";
