@@ -24,14 +24,14 @@ final class TokenStatsScannerTests: XCTestCase {
 
     private lazy var calendar: Calendar = {
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = .current
+        cal.timeZone = .gmt
         return cal
     }()
 
     private lazy var dayFormatter: DateFormatter = {
         let f = DateFormatter()
         f.calendar = calendar
-        f.timeZone = .current
+        f.timeZone = .gmt
         f.dateFormat = "yyyy-MM-dd"
         return f
     }()
@@ -173,5 +173,62 @@ final class TokenStatsScannerTests: XCTestCase {
 
         XCTAssertTrue(stats.isAvailable)
         XCTAssertEqual(stats.allTime, 0)
+    }
+
+    // MARK: - Timezone regression
+
+    /// Pins day bucketing to UTC. JSONL `timestamp` fields are UTC instants and the `claude` CLI
+    /// buckets `dailyModelTokens` by the UTC calendar day (verified against the real corpus:
+    /// summing both ways, only UTC matched `stats-cache.json` on every day - local was off by
+    /// ~20%). This service's day arithmetic - `today`, window bounds, the day-key comparisons -
+    /// must therefore all be done in UTC too, or a local-timezone `today` gets compared against
+    /// UTC-keyed data.
+    ///
+    /// `referenceDate` is a fixed instant, 2026-08-10T20:00:00Z, chosen because its UTC calendar
+    /// day (2026-08-10) and its local calendar day at UTC+7 (2026-08-11, since 20:00 UTC + 7h
+    /// rolls to 03:00 the next day) disagree - this is exactly the skew the bug produced on a
+    /// UTC+7 machine every night between 00:00 and 07:00 local. A `Date()` reference would not
+    /// discriminate: most hours of most days the UTC and local dates coincide, so a reverted,
+    /// local-timezone service would pass this test as often as it fails it depending on when it
+    /// happened to run.
+    ///
+    /// The expected day strings are hardcoded UTC literals rather than computed via this test's
+    /// own calendar/formatter, so a shared bug in both the service and the fixture-generation
+    /// code can't cancel out and hide a real regression - the literals encode what the *correct*
+    /// window is, independent of how the service (or this file's helpers) compute it.
+    ///
+    /// With a correct UTC service, the 7-day window ending on 2026-08-10 (UTC) is
+    /// 2026-08-04...2026-08-10 inclusive. A line dated 2026-08-04 (the oldest in-window day) must
+    /// count; a line dated 2026-08-03 (one day older) must not. Under the pre-fix local-timezone
+    /// bug at UTC+7, `today` would resolve to the local date 2026-08-11, shifting the window to
+    /// 2026-08-05...2026-08-11 and silently dropping the 2026-08-04 line - exactly the undercount
+    /// this test exists to catch.
+    func testSevenDayWindowUsesUTCCalendarDayNotLocal() {
+        var utcCalendar = Calendar(identifier: .gregorian)
+        utcCalendar.timeZone = .gmt
+        let referenceDate = utcCalendar.date(from: DateComponents(
+            year: 2026, month: 8, day: 10, hour: 20, minute: 0, second: 0
+        ))!
+
+        let dir = writeRawJSONL(
+            line("2026-08-04", input: 100, output: 1) + "\n"
+            + line("2026-08-03", input: 999_999, output: 999_999)
+        )
+
+        let stats = TokenStatsService().load(
+            enabledFrames: [.tokens7Days],
+            statsURL: tempDir.appendingPathComponent("no-such-cache.json"),
+            projectsDir: dir,
+            referenceDate: referenceDate
+        )
+
+        XCTAssertTrue(stats.isAvailable)
+        XCTAssertEqual(
+            stats.last7Days, 101,
+            "2026-08-04 is the oldest day in the UTC 7-day window ending 2026-08-10 and must "
+            + "count; 2026-08-03 is one day outside it and must not, even though referenceDate's "
+            + "local date at UTC+7 is 2026-08-11, which under the old local-timezone bug would "
+            + "shift the window to 2026-08-05...2026-08-11 and drop the 2026-08-04 line"
+        )
     }
 }

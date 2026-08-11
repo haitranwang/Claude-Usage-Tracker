@@ -109,16 +109,26 @@ nonisolated struct TokenStatsService {
 
     // MARK: - Calendar / date-key helpers
 
+    /// UTC, not `.current`: day keys are the first 10 characters of a JSONL line's `timestamp`
+    /// field, which is an ISO-8601 UTC instant (e.g. `"2026-08-10T20:00:00.000Z"` -> the day key
+    /// `"2026-08-10"`). The `claude` CLI itself buckets `dailyModelTokens` by that same UTC day -
+    /// verified against the real corpus, where UTC bucketing matched `stats-cache.json` exactly
+    /// and local bucketing was off by ~20%. Every date this service builds (`today`, window
+    /// bounds, the `scanFrom` mtime bound) must therefore also be UTC, or a local-timezone
+    /// `today` gets compared against UTC-keyed data and silently drops or double-counts a day
+    /// near local midnight. Do not change this back to `.current` - that reintroduces exactly
+    /// that skew.
     private static let calendar: Calendar = {
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = .current
+        cal.timeZone = .gmt
         return cal
     }()
 
+    /// UTC, matching `calendar` above - see its comment for why.
     private static let dayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.calendar = calendar
-        formatter.timeZone = .current
+        formatter.timeZone = .gmt
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter
     }()

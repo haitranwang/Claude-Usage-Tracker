@@ -31,14 +31,14 @@ final class TokenStatsServiceTests: XCTestCase {
 
     private lazy var calendar: Calendar = {
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = .current
+        cal.timeZone = .gmt
         return cal
     }()
 
     private lazy var dayFormatter: DateFormatter = {
         let f = DateFormatter()
         f.calendar = calendar
-        f.timeZone = .current
+        f.timeZone = .gmt
         f.dateFormat = "yyyy-MM-dd"
         return f
     }()
