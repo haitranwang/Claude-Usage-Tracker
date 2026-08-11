@@ -266,6 +266,11 @@ class MenuBarManager: NSObject, ObservableObject {
         }
         shortcutManager.onRefresh = { [weak self] in
             self?.refreshUsage()
+            // User-initiated refresh - also refresh token stats rather than waiting out
+            // the 300s coordinator interval. `refreshUsage()` alone doesn't cover this:
+            // it's also called by the 30s auto-refresh timer, wake-from-sleep, and the
+            // network-available callback, none of which should force a token rescan.
+            self?.tokenStatsCoordinator.refreshNow()
         }
         shortcutManager.onOpenSettings = { [weak self] in
             self?.preferencesClicked()
@@ -536,6 +541,9 @@ class MenuBarManager: NSObject, ObservableObject {
             manager: self,
             onRefresh: { [weak self] in
                 self?.refreshUsage()
+                // User-initiated refresh - see setupShortcuts() for why this can't live
+                // inside refreshUsage() itself.
+                self?.tokenStatsCoordinator.refreshNow()
             },
             onPreferences: { [weak self] in
                 self?.closePopoverOrWindow()
@@ -703,6 +711,9 @@ class MenuBarManager: NSObject, ObservableObject {
 
     @objc private func contextMenuRefresh() {
         refreshUsage()
+        // User-initiated refresh - see setupShortcuts() for why this can't live inside
+        // refreshUsage() itself.
+        tokenStatsCoordinator.refreshNow()
     }
 
     private func closePopover() {
@@ -904,6 +915,15 @@ class MenuBarManager: NSObject, ObservableObject {
                     let newConfig = self.profileManager.activeProfile?.iconConfig ?? .default
                     self.updateMenuBarDisplay(with: newConfig)
                 }
+
+                // This notification covers enabling/disabling metrics (including token
+                // frames) and the countCacheTokens toggle. TokenStatsService leaves a
+                // newly-enabled frame at 0 while still reporting isAvailable: true, so
+                // without an immediate refresh a just-enabled token card would render a
+                // plausible-looking wrong number for up to 300s instead of catching up
+                // right away. Safe to call unconditionally here: this notification fires
+                // once per discrete settings save, not in bursts.
+                self.tokenStatsCoordinator.refreshNow()
             }
         }
     }
@@ -1915,7 +1935,12 @@ extension MenuBarManager: NSPopoverDelegate {
         // positioning) conflict with the window's layout constraints.
         let contentView = PopoverContentView(
             manager: self,
-            onRefresh: { [weak self] in self?.refreshUsage() },
+            onRefresh: { [weak self] in
+                self?.refreshUsage()
+                // User-initiated refresh - see setupShortcuts() for why this can't live
+                // inside refreshUsage() itself.
+                self?.tokenStatsCoordinator.refreshNow()
+            },
             onPreferences: { [weak self] in
                 self?.closePopoverOrWindow()
                 self?.preferencesClicked()
@@ -1986,10 +2011,11 @@ extension MenuBarManager: NSWindowDelegate {
 
 // MARK: - Token stats refresh
 
-// `TokenStatsInputProviding` is read synchronously on the main thread by `refreshNow()`, so
-// these accessors stay main-actor isolated like the rest of the class. If the compiler objects
-// to the conformance, annotate the extension `@MainActor` rather than making the properties
-// `nonisolated` - they read the active profile, which is main-actor state.
+// `TokenStatsInputProviding` is read synchronously on the main thread by `refreshNow()`.
+// These accessors need no isolation annotation of their own: the app target sets
+// `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so `MenuBarManager`, like every other
+// unannotated type in this module, is already main-actor isolated - which is exactly where
+// the active profile these properties read lives.
 extension MenuBarManager: TokenStatsInputProviding {
     var enabledTokenFrames: Set<MenuBarMetricType> {
         let cfg = profileManager.activeProfile?.iconConfig ?? .default
