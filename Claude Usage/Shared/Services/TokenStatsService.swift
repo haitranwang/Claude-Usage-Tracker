@@ -375,14 +375,17 @@ nonisolated struct TokenStatsService {
     /// as strings against calendar-day bounds. Without this check, an impossible date like
     /// `"2026-07-32"` satisfies those string comparisons (it sorts between real dates) and its
     /// tokens land under a key that `windowSum` can never enumerate - invisible to 7D/30D but
-    /// still summed into all-time. This narrows that problem rather than eliminating it: it is
-    /// a shape check, not full calendar validation, so a shaped-but-impossible date whose month
+    /// still summed into all-time. This runs per line, so it's a character-by-character shape
+    /// check rather than the `DateFormatter.date(from:)` round trip it replaced, which fully
+    /// validated the calendar date and so had no such gap.
+    ///
+    /// This narrows that problem rather than closing it the way `DateFormatter` did: it is a
+    /// shape check, not full calendar validation, so a shaped-but-impossible date whose month
     /// and day both fall within `01-31` (`2026-02-30`, `2026-04-31`, `2026-02-29` in a non-leap
-    /// year, and similar) still passes and can still inflate all-time the same way. That gap is
-    /// deliberately left open: CLI-emitted ISO-8601 timestamps never produce those shapes, and
-    /// full calendar validation is out of scope for a per-line hot-path check. This runs per
-    /// line, so it's a character-by-character shape check rather than a `DateFormatter`
-    /// round trip.
+    /// year, and similar) still passes, lands under a key the window sums still cannot enumerate,
+    /// and so still inflates all-time while contributing to no window. That gap is deliberately
+    /// left open rather than fixed: CLI-emitted ISO-8601 timestamps never produce those shapes,
+    /// and full calendar validation is out of scope for a per-line hot-path check.
     private static func isValidDayKey(_ key: some StringProtocol) -> Bool {
         guard key.count == 10 else { return false }
         // No per-line allocation: digits are folded into four locals as they're walked, rather

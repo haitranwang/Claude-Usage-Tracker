@@ -223,9 +223,10 @@ class MenuBarManager: NSObject, ObservableObject {
         startAutoRefresh()
 
         // Start the token-stats refresh coordinator on its own 300s cadence, independent of
-        // the 30s usage refresh above. Started once, here, alongside the manager's other
-        // long-lived timers - not inside startAutoRefresh(), which also runs on every
-        // interval change and would otherwise restart this timer too.
+        // the 30s usage refresh above. Deliberately not inside startAutoRefresh(), which also
+        // runs on every interval change and would otherwise restart this timer too. `setup()`
+        // itself runs from three call sites in AppDelegate, so this can run more than once per
+        // launch; that's fine because `start()` calls `stop()` first, making it idempotent.
         tokenStatsCoordinator.start()
 
         // Start auto-start session service (5-minute cycle for all profiles)
@@ -411,6 +412,13 @@ class MenuBarManager: NSObject, ObservableObject {
         restartAutoRefreshWithInterval(profile.refreshInterval)
 
         // 3. Update menu bar based on current display mode
+        // The new profile may enable a different set of token frames (or none), so the
+        // just-switched-from profile's `tokenStats` no longer describes what's about to be
+        // drawn - a newly-shown frame would be 0 there while isAvailable is still true. Clear
+        // it before redrawing below so the redraw falls back to the unavailable placeholder
+        // until the refresh triggered at the bottom of this method lands.
+        self.tokenStats = nil
+
         // IMPORTANT: In multi-profile mode, we update all icons, not just switch config
         if profileManager.displayMode == .multi {
             // Multi-profile mode - update icons without recreating status items
@@ -906,6 +914,13 @@ class MenuBarManager: NSObject, ObservableObject {
 
             // Reload configuration from active profile (already on main queue)
             Task { @MainActor in
+                // A newly-enabled token frame is 0 in the stale `tokenStats` still published from
+                // before this config change, while `TokenStats.isAvailable` on it is still true -
+                // so redrawing with it now would render a plausible-looking wrong 0 for the
+                // 1.5-6.3s the scan below takes. Clear it first so the redraw below shows the
+                // normal unavailable placeholder ("—", see MenuBarIconRenderer) instead.
+                self.tokenStats = nil
+
                 // Handle differently based on display mode
                 if self.profileManager.displayMode == .multi {
                     // Multi-profile mode - update icons without recreating status items
@@ -2018,6 +2033,12 @@ extension MenuBarManager: NSWindowDelegate {
 // the active profile these properties read lives.
 extension MenuBarManager: TokenStatsInputProviding {
     var enabledTokenFrames: Set<MenuBarMetricType> {
+        // Multi-profile mode never renders token metrics (StatusBarUIManager.updateMultiProfileButtons
+        // takes no tokenStats parameter), so scanning for it there would pay the full JSONL-scan cost
+        // - up to several seconds and hundreds of MB of memory-mapped I/O, every 300s plus every
+        // profile switch and settings save - for a value nothing draws. `refreshNow()` treats an
+        // empty frame set as "nothing to do", so returning empty here is sufficient to skip the scan.
+        guard profileManager.displayMode == .single else { return [] }
         let cfg = profileManager.activeProfile?.iconConfig ?? .default
         return Set(cfg.enabledMetrics.map { $0.metricType }.filter { $0.isTokenMetric })
     }

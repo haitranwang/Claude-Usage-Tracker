@@ -1,6 +1,8 @@
 import Foundation
 
-/// Aggregated Claude Code CLI token totals (input + output, excluding cache).
+/// Aggregated Claude Code CLI token totals. By default this counts all four token kinds (input,
+/// output, cache read, cache creation) to match what `claude` itself reports; a "Count cache
+/// tokens" toggle switches individual frames to input + output only.
 ///
 /// `nonisolated`: a plain value type with no shared mutable state, safe to touch from any
 /// isolation domain. `TokenStatsService.load` (itself `nonisolated` so it can run its JSONL scan
@@ -11,7 +13,11 @@ nonisolated struct TokenStats: Codable, Equatable {
     let allTime: Int
     let last7Days: Int
     let last30Days: Int
-    /// False when the local stats cache is absent or unreadable.
+    /// False when nothing backing the enabled frames could be read. Judged per enabled frame's
+    /// own source, not just "is the cache present": in cache-exclusive mode the cache backs
+    /// all-time but not the window frames, so a readable cache alone is not enough once a window
+    /// frame is enabled - that also requires JSONL to have parsed at least one day. See
+    /// `TokenStatsService.loadCacheExclusive` for the full breakdown.
     let isAvailable: Bool
 
     static let unavailable = TokenStats(allTime: 0, last7Days: 0, last30Days: 0, isAvailable: false)
